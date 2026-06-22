@@ -79,6 +79,49 @@ enum Mode {
     News(NewsArgs),
     /// Print which hook layers are active (git + Claude Code).
     Status,
+    /// LOCAL/INTERNAL multi-agent review. Shells out to the
+    /// `slop-review-local` helper which drives the nsed
+    /// sloppoke_review_0v1 bundle against the current git work-tree.
+    /// Not for end-user release — gated behind an operator token
+    /// on the orchestrator side and only built locally.
+    Review(ReviewArgs),
+    /// Drop a single-use bypass token at `.slop/bypass-token` with the
+    /// caller's reason. The pre-commit hook consumes (deletes) the
+    /// token on its next run and skips the SLOP gate exactly once.
+    /// Reason is appended to `.slop/bypass-log.jsonl` for audit so
+    /// every bypass leaves a trail. Designed for the Claude Code
+    /// plugin path where SLOP_SKIP_HOOK=1 can't reach the hook
+    /// because the env is set in a subshell after the PreToolUse
+    /// hook fires.
+    Bypass(BypassArgs),
+}
+
+#[derive(Parser, Debug, Clone)]
+struct BypassArgs {
+    /// Free-text reason for the bypass. Goes into the audit log.
+    reason: String,
+}
+
+#[derive(Parser, Debug, Clone)]
+struct ReviewArgs {
+    /// Pass-through of REMOTE_URL into the helper. Default: detected
+    /// from the current repo's `forgejo` or `origin` remote, with
+    /// any embedded basic-auth stripped by the helper.
+    #[arg(long)]
+    remote_url: Option<String>,
+    /// Override the head SHA. Default: current HEAD.
+    #[arg(long)]
+    head: Option<String>,
+    /// Override the base SHA. Default: helper walks
+    /// `forgejo/dev → origin/dev → dev → forgejo/main → origin/main → main`.
+    #[arg(long)]
+    base: Option<String>,
+    /// Optional comma-separated forgejo allowlist override.
+    #[arg(long)]
+    allowlist: Option<String>,
+    /// Forward extra trailing args to the helper verbatim.
+    #[arg(last = true)]
+    rest: Vec<String>,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -155,6 +198,14 @@ struct PokeArgs {
     /// Print the request JSON and exit without contacting the server.
     #[arg(long)]
     dry_run: bool,
+    /// Emit the verdict + findings as one JSON object on stdout
+    /// instead of the human-readable two-channel layout (stderr
+    /// summary + stdout colored patch). Designed for agentic
+    /// callers (Claude Code, CI bots) that need to bucket findings
+    /// without parsing the prose verdict line. Suppresses the
+    /// patch on stdout — pipe through `jq -r '.patch'` to apply.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -256,12 +307,17 @@ fn run(cli: Cli) -> Result<()> {
         Mode::InstallHook(a) => run_install_hook(a),
         Mode::News(a) => news::run(&news_server_url(), a.all, a.ack),
         Mode::Status => run_status(),
+        Mode::Review(a) => run_review(a),
+        Mode::Bypass(a) => run_bypass(a),
     }
 }
 
 const HOOK_SCRIPT: &str = r##"#!/usr/bin/env sh
 # Installed by `slop install-hook`. Blocks `git commit` when sloppoke
-# flags slop in the staged diff. Bypass once with `git commit --no-verify`.
+# flags slop in the staged diff. Bypass once with `git commit --no-verify`,
+# or `slop bypass "<reason>"` to drop a single-use token the hook
+# consumes on its next run (useful from agents that can't set
+# environment variables before `git commit` fires).
 set -e
 
 if ! command -v slop >/dev/null 2>&1; then
@@ -271,6 +327,17 @@ fi
 
 # Nothing staged → nothing to scan.
 if git diff --cached --quiet; then
+  exit 0
+fi
+
+# Single-use bypass token. Operator (or an agent acting on their
+# behalf) drops it via `slop bypass "<reason>"`; the hook consumes
+# the file and skips the scan exactly once. Mirrors the trust model
+# of `--no-verify` but leaves an audit trail.
+if [ -f .slop/bypass-token ]; then
+  reason=$(cat .slop/bypass-token 2>/dev/null | head -1)
+  rm -f .slop/bypass-token
+  echo "slop: bypass token consumed (reason: ${reason:-unspecified}). SLOP gate skipped this commit." >&2
   exit 0
 fi
 
@@ -486,6 +553,86 @@ fn print_defense_in_depth_summary() {
 
 fn run_status() -> Result<()> {
     print_defense_in_depth_summary();
+    Ok(())
+}
+
+// ── bypass ───────────────────────────────────────────────────────
+//
+// Drops `.slop/bypass-token` with the caller's reason. The
+// pre-commit hook (see `HOOK_SCRIPT`) reads the file, deletes it,
+// and skips the SLOP gate exactly once. Reason is also appended to
+// `.slop/bypass-log.jsonl` so the operator can audit who bypassed
+// what without grepping shell history.
+
+fn run_bypass(args: BypassArgs) -> Result<()> {
+    let dir = PathBuf::from(".slop");
+    fs::create_dir_all(&dir).context("create .slop directory")?;
+    let token_path = dir.join("bypass-token");
+    fs::write(&token_path, format!("{}\n", args.reason.trim()))
+        .with_context(|| format!("write {}", token_path.display()))?;
+    let log_path = dir.join("bypass-log.jsonl");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let user = std::env::var("USER").unwrap_or_else(|_| "unknown".to_string());
+    let entry = serde_json::json!({
+        "ts": now,
+        "reason": args.reason,
+        "user": user,
+    });
+    let mut log = fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(&log_path)
+        .with_context(|| format!("open {}", log_path.display()))?;
+    use std::io::Write;
+    writeln!(log, "{entry}").context("append bypass-log.jsonl")?;
+    eprintln!(
+        "slop: bypass token armed at {}. Next `git commit` skips the SLOP gate; the hook deletes the token after it consumes it.",
+        token_path.display()
+    );
+    Ok(())
+}
+
+// ── review (LOCAL ONLY) ──────────────────────────────────────────
+//
+// Thin wrapper: shells out to `slop-review-local` which carries the
+// nsed bundle wiring + operator-token load + fleet boot + deliberation
+// trigger. Nothing about the review flow lives inside this binary
+// beyond the dispatch — keeps the public-release surface clean if the
+// binary ever ships before the helper does.
+
+fn run_review(args: ReviewArgs) -> Result<()> {
+    let helper = std::env::var("SLOP_REVIEW_HELPER").unwrap_or_else(|_| {
+        let home = std::env::var("HOME").unwrap_or_default();
+        format!("{home}/.local/bin/slop-review-local")
+    });
+    if !PathBuf::from(&helper).is_file() {
+        anyhow::bail!(
+            "slop review: helper not found at {helper}. \
+             Set SLOP_REVIEW_HELPER or install ~/.local/bin/slop-review-local \
+             (see nsed sloppoke_review_0v1 bundle)."
+        );
+    }
+    let mut cmd = std::process::Command::new(&helper);
+    if let Some(v) = args.remote_url {
+        cmd.env("REMOTE_URL", v);
+    }
+    if let Some(v) = args.head {
+        cmd.env("HEAD_SHA", v);
+    }
+    if let Some(v) = args.base {
+        cmd.env("BASE_SHA", v);
+    }
+    if let Some(v) = args.allowlist {
+        cmd.env("ALLOWLIST", v);
+    }
+    cmd.args(&args.rest);
+    let status = cmd.status().with_context(|| format!("spawning {helper}"))?;
+    if !status.success() {
+        anyhow::bail!("slop review: helper exited {}", status);
+    }
     Ok(())
 }
 
@@ -843,6 +990,14 @@ fn run_poke(args: PokeArgs) -> Result<()> {
     } else {
         resolve_patch(&args)?
     };
+    // `.slopignore` skips per-file blocks before they reach the
+    // server. Cuts both bill (smaller payload) AND noise (server
+    // never matches FP patterns the operator has already triaged).
+    let ignore = load_slopignore().unwrap_or_else(|e| {
+        eprintln!("slop: ignoring malformed .slopignore — {e}");
+        globset::GlobSet::empty()
+    });
+    let patch = filter_patch_by_slopignore(&patch, &ignore);
     if patch.trim().is_empty() {
         bail!("nothing to scan ({source})");
     }
@@ -874,6 +1029,30 @@ fn run_poke(args: PokeArgs) -> Result<()> {
         }
     };
     save_plan(&resp, &patch)?;
+
+    if args.json {
+        // Single JSON object on stdout — designed for Claude Code /
+        // CI bots that want to bucket findings without parsing
+        // prose. Suppresses the human-readable summary + colored
+        // patch path entirely; pipe through `jq -r '.patch' |
+        // git apply --unidiff-zero` to apply.
+        let out = serde_json::json!({
+            "verdict": resp.verdict,
+            "poke_id": resp.poke_id,
+            "elapsed_ms": resp.elapsed_ms,
+            "usage": {
+                "poke_calls": resp.usage.poke_calls,
+                "cap": resp.cap,
+            },
+            "findings_count": resp.findings.len(),
+            "findings": resp.findings,
+            "patch": resp.patch,
+            "patch_present": !resp.patch.trim().is_empty(),
+        });
+        println!("{}", serde_json::to_string(&out)?);
+        return Ok(());
+    }
+
     // Verdict + quota line lives on stderr so it's visible to
     // interactive users (self-teaching, quota awareness) without
     // polluting `> foo.patch` redirections or `| git apply` pipes.
@@ -1164,6 +1343,88 @@ fn resolve_patch(args: &PokeArgs) -> Result<(String, String)> {
     Ok((git_diff(&["HEAD"])?, "git diff HEAD (default)".into()))
 }
 
+/// Read `.slopignore` from the repo root and return a globset of
+/// path patterns the scan should skip. Empty when the file is
+/// absent. One glob per line; `#` starts a comment.
+///
+/// Designed for repo-level false-positive suppression — projects with
+/// a known FP pattern (postgres.js tagged templates in `*.ts`,
+/// `.env.example` placeholder credentials, generated SDK shims at
+/// `*/sdk-alpha/**`) can list the paths once and stop sending those
+/// hunks to the scorer every commit.
+fn load_slopignore() -> Result<globset::GlobSet> {
+    let mut builder = globset::GlobSetBuilder::new();
+    let path = PathBuf::from(".slopignore");
+    if !path.exists() {
+        return Ok(builder.build()?);
+    }
+    let raw = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+    for (n, line) in raw.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let glob = globset::Glob::new(trimmed)
+            .with_context(|| format!(".slopignore line {}: bad glob {:?}", n + 1, trimmed))?;
+        builder.add(glob);
+    }
+    Ok(builder.build()?)
+}
+
+/// Drop file blocks from a unified diff whose path matches a glob in
+/// the supplied globset. A no-op when the globset is empty. Used to
+/// strip known-FP paths from the patch before sending it to the
+/// scorer so the server never spends cycles on them.
+///
+/// Per-file blocks are demarcated by `diff --git` headers — git's
+/// own canonical separator. Lines before the first `diff --git` are
+/// preserved as the patch preamble (`mbox` headers, `From <sha>`,
+/// etc.) so this works on `git format-patch` output too.
+fn filter_patch_by_slopignore(patch: &str, ignore: &globset::GlobSet) -> String {
+    if ignore.is_empty() {
+        return patch.to_string();
+    }
+    let mut out = String::with_capacity(patch.len());
+    let mut block = String::new();
+    let mut block_path: Option<String> = None;
+    let mut in_block = false;
+
+    let flush =
+        |out: &mut String, block: &str, path: &Option<String>, ignore: &globset::GlobSet| {
+            let drop = path.as_deref().map(|p| ignore.is_match(p)).unwrap_or(false);
+            if !drop {
+                out.push_str(block);
+            }
+        };
+
+    for line in patch.split_inclusive('\n') {
+        if let Some(rest) = line.strip_prefix("diff --git ") {
+            if in_block {
+                flush(&mut out, &block, &block_path, ignore);
+                block.clear();
+            }
+            in_block = true;
+            // `diff --git a/<old> b/<new>` — extract the b-side path
+            // since renames keep slop interested in where the content
+            // landed, not where it came from.
+            block_path = rest
+                .split_whitespace()
+                .nth(1)
+                .and_then(|s| s.strip_prefix("b/"))
+                .map(|s| s.trim_end().to_string());
+        }
+        if in_block {
+            block.push_str(line);
+        } else {
+            out.push_str(line);
+        }
+    }
+    if in_block {
+        flush(&mut out, &block, &block_path, ignore);
+    }
+    out
+}
+
 /// Rewrite every `HEAD~N` token in `selector` so N never exceeds the
 /// repo's actual history depth. Public repos often have only a handful
 /// of commits — without this, `slop poke --range HEAD~10..HEAD` on a
@@ -1380,11 +1641,21 @@ fn load_plan() -> Result<CachedPlan> {
 
 /// Truncate a unified diff to at most `max` bytes on a line boundary,
 /// appending a marker so the reviewer knows there's more.
+///
+/// The slice has to land on a UTF-8 char boundary or `&diff[..n]`
+/// panics — the historical implementation indexed at `max` directly
+/// and exploded on any patch with a multi-byte char (em-dash, CJK,
+/// emoji) straddling the boundary. Walk back to the nearest valid
+/// boundary first, then look for a newline in the safe prefix.
 fn cap_diff(diff: &str, max: usize, label: &str) -> String {
     if diff.len() <= max {
         return diff.to_string();
     }
-    let cut = diff[..max].rfind('\n').unwrap_or(max);
+    let safe_max = (0..=max)
+        .rev()
+        .find(|&i| diff.is_char_boundary(i))
+        .unwrap_or(0);
+    let cut = diff[..safe_max].rfind('\n').unwrap_or(safe_max);
     format!(
         "{}\n... ({} truncated at {} bytes; see poke_id for full row)",
         &diff[..cut],
@@ -1461,6 +1732,7 @@ mod tests {
             repo: repo.map(str::to_string),
             gh: gh.map(str::to_string),
             dry_run: false,
+            json: false,
         }
     }
 
@@ -1479,6 +1751,7 @@ mod tests {
             repo: None,
             gh: None,
             dry_run: false,
+            json: false,
         }
     }
 
@@ -1492,6 +1765,7 @@ mod tests {
             repo: None,
             gh: None,
             dry_run: false,
+            json: false,
         }
     }
 
@@ -1637,10 +1911,78 @@ mod tests {
         let marker_at = out.find("\n... (").expect("marker present");
         let body = &out[..marker_at];
         assert!(
-            body.is_empty() || body.ends_with('\n') || body.chars().rev().next() != Some(' '),
+            body.is_empty() || body.ends_with('\n') || !body.ends_with(' '),
             "body should land on a line boundary: tail={:?}",
             &body[body.len().saturating_sub(40)..]
         );
+    }
+
+    #[test]
+    fn filter_patch_by_slopignore_drops_matching_file_blocks() {
+        let patch = "\
+diff --git a/src/lib.rs b/src/lib.rs
+index aaa..bbb 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1 +1 @@
+-old
++new
+diff --git a/.env.example b/.env.example
+index ccc..ddd 100644
+--- a/.env.example
++++ b/.env.example
+@@ -1 +1 @@
+-OLD=1
++NEW=1
+";
+        let mut b = globset::GlobSetBuilder::new();
+        b.add(globset::Glob::new(".env.example").unwrap());
+        let g = b.build().unwrap();
+        let out = filter_patch_by_slopignore(patch, &g);
+        assert!(out.contains("src/lib.rs"));
+        assert!(!out.contains(".env.example"));
+    }
+
+    #[test]
+    fn filter_patch_by_slopignore_empty_globset_is_passthrough() {
+        let patch = "diff --git a/foo b/foo\n+content\n";
+        let g = globset::GlobSet::empty();
+        assert_eq!(filter_patch_by_slopignore(patch, &g), patch);
+    }
+
+    #[test]
+    fn filter_patch_by_slopignore_keeps_preamble_when_present() {
+        let patch = "\
+From abc Mon Sep 17 00:00:00 2001
+Subject: stuff
+
+diff --git a/keep.rs b/keep.rs
++content
+";
+        let g = globset::GlobSet::empty();
+        assert!(filter_patch_by_slopignore(patch, &g).starts_with("From abc"));
+    }
+
+    /// Regression: `cap_diff` historically used `diff[..max]` which
+    /// panicked when `max` landed mid-multi-byte char ("end byte index
+    /// 2048 is not a char boundary; it is inside '—'"). Build a diff
+    /// whose nearest \n to `max` sits exactly past an em-dash (3 bytes)
+    /// straddling the budget so any reintroduction of raw byte slicing
+    /// blows up here instead of in production.
+    #[test]
+    fn cap_diff_does_not_panic_on_multibyte_boundary() {
+// TODO(slop): placeholder identifier — pick a name that says what this is
+// TODO(slop): placeholder identifier — pick a name that says what this is
+        let prefix = "+ ascii padding line\n".repeat(100);
+        let payload = "+ comment — with em dash and more text following\n".repeat(200);
+        let input = format!("{prefix}{payload}");
+        for budget in [1024usize, 2048, 3000, 4097] {
+            let out = cap_diff(&input, budget, "test");
+            assert!(
+                out.contains("test truncated"),
+                "marker missing at budget {budget}"
+            );
+        }
     }
 
     /// Single-test serialization for cwd / env mutating cases.
