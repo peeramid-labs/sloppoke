@@ -947,19 +947,23 @@ fn run_poke(args: PokeArgs) -> Result<()> {
     } else {
         resolve_patch(&args)?
     };
-    // `.slopignore` skips per-file blocks before they reach the
-    // server. Cuts both bill (smaller payload) AND noise (server
-    // never matches FP patterns the operator has already triaged).
-    // `--disable <glob>` (file-only, no `:LINE` suffix) folds into
-    // the same globset so a one-shot mute also strips its file
-    // block pre-send. Line-level `--disable <glob>:LINE` targets
-    // ride along and apply post-receive against finding records
-    // (and against future hunk-level patch filtering — TODO).
-    // Validate --disable shape now so a malformed target bails
+    // Pre-send filter chain:
+    //   1. `.slopignore` + `--disable <glob>` strip whole file blocks
+    //      so the muted file never hits the wire (smaller bill, fewer
+    //      hits).
+    //   2. `--disable <glob>:<8hex>` redacts individual `+` lines
+    //      whose content hashes to a target checksum — converts the
+    //      `+` prefix to a context space so the catalog skips it.
+    //      Line-content checksums survive line-number drift, which
+    //      file-paths don't; the operator pastes them from the
+    //      verdict output and the mute outlives surrounding refactors.
+    //
+    // Validate `--disable` shape first so a malformed target bails
     // BEFORE the patch hits the wire (and burns quota).
-    let _ = parse_disable_targets(&args.disable)?;
+    let disable_targets = parse_disable_targets(&args.disable)?;
     let ignore = build_pre_send_globset(&args.disable)?;
     let patch = filter_patch_by_slopignore(&patch, &ignore);
+    let patch = redact_patch_by_checksum(&patch, &disable_targets);
     if patch.trim().is_empty() {
         bail!("nothing to scan ({source}) — every changed file is muted via .slopignore / --disable");
     }
@@ -999,7 +1003,6 @@ fn run_poke(args: PokeArgs) -> Result<()> {
     // next scan has to re-pass the targets, or
     // `slop learn --disable <target> "<reason>"` upstream so the
     // server stops flagging the pattern for this org.
-    let disable_targets = parse_disable_targets(&args.disable)?;
     let (kept_findings, muted): (Vec<_>, Vec<_>) = resp
         .findings
         .into_iter()
@@ -1428,40 +1431,92 @@ fn filter_patch_by_slopignore(patch: &str, ignore: &globset::GlobSet) -> String 
     out
 }
 
+/// Address granularity for a parsed `--disable` target.
+///
+/// `Checksum` is the recommended form for muting a specific line:
+/// stable across line shifts because the address is a hash of the
+/// line content, not the line number. `Line` is the escape hatch
+/// for ad-hoc mutes when the operator doesn't have a checksum
+/// handy. `Whole` strips the entire file block pre-send.
+#[derive(Debug)]
+enum DisableScope {
+    Whole,
+    Line(usize),
+    Checksum(String),
+}
+
 /// One parsed `--disable` target. Mirrors patch-notation: a path
-/// glob, optionally narrowed to a single line. Compiled to a
-/// globset matcher at parse time so per-finding checks are O(1).
+/// glob, optionally narrowed to a single line (by number or — better
+/// — by content checksum). Compiled to a globset matcher at parse
+/// time so per-finding checks are O(1).
 #[derive(Debug)]
 struct DisableTarget {
     matcher: globset::GlobMatcher,
-    line: Option<usize>,
+    scope: DisableScope,
+}
+
+/// 8-hex SHA-256 fingerprint of the matched line content. The
+/// fingerprint is what `--disable <glob>:<8hex>` addresses. Line
+/// numbers drift on every refactor; content checksums don't —
+/// mute lifetime tracks code lifetime. Whitespace differences DO
+/// change the fingerprint by design: a reformat is a real edit and
+/// should re-prompt the operator to decide whether the new shape
+/// is still a FP.
+pub fn finding_checksum(line: &str) -> String {
+    let mut hasher = sha2::Sha256::new();
+    use sha2::Digest;
+    hasher.update(line.as_bytes());
+    let out = hasher.finalize();
+    let mut hex = String::with_capacity(8);
+    for byte in &out[..4] {
+        use std::fmt::Write;
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
+}
+
+fn looks_like_checksum(s: &str) -> bool {
+    s.len() == 8 && s.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
 }
 
 /// Parse one CLI `--disable` argument. Grammar:
-///   <glob>            → file-level mute
-///   <glob>:<line>     → line-level mute
-/// The line suffix is everything after the LAST `:` so paths
-/// containing `:` (e.g. Windows drive letters in CI scenarios) only
-/// confuse the parser when the user actually means to address a
-/// numeric line — at which point we'd reject any non-numeric tail
-/// rather than misparse.
+///   <glob>             file-level mute
+///   <glob>:<8-hex>     line-content checksum mute (recommended)
+///   <glob>:<line-num>  literal line number mute (drifts on refactor)
+///
+/// The suffix after the last `:` is inspected:
+///   - 8 lowercase-hex characters → checksum
+///   - all digits → line number
+///   - anything else → treat as part of the path (raw glob)
 fn parse_disable_target(raw: &str) -> Result<DisableTarget> {
     let raw = raw.trim();
     if raw.is_empty() {
         anyhow::bail!("--disable: empty target");
     }
-    let (glob_str, line) = match raw.rsplit_once(':') {
+    let (glob_str, scope) = match raw.rsplit_once(':') {
+        Some((prefix, tail)) if looks_like_checksum(tail) => {
+            (prefix, DisableScope::Checksum(tail.to_string()))
+        }
+        Some((_, tail))
+            if tail.len() == 8 && tail.chars().all(|c| c.is_ascii_hexdigit()) =>
+        {
+            anyhow::bail!(
+                "--disable {raw:?}: checksum suffix must be lowercase hex \
+                 (got {tail:?}); the verdict output always prints lowercase, \
+                 copy-paste from there"
+            );
+        }
         Some((prefix, tail)) => match tail.parse::<usize>() {
-            Ok(n) => (prefix, Some(n)),
-            Err(_) => (raw, None),
+            Ok(n) => (prefix, DisableScope::Line(n)),
+            Err(_) => (raw, DisableScope::Whole),
         },
-        None => (raw, None),
+        None => (raw, DisableScope::Whole),
     };
     let glob = globset::Glob::new(glob_str)
         .with_context(|| format!("--disable {raw:?}: bad glob"))?;
     Ok(DisableTarget {
         matcher: glob.compile_matcher(),
-        line,
+        scope,
     })
 }
 
@@ -1470,10 +1525,10 @@ fn parse_disable_target(raw: &str) -> Result<DisableTarget> {
 fn parse_disable_targets(raws: &[String]) -> Result<Vec<DisableTarget>> {
     let mut out = Vec::with_capacity(raws.len());
     let mut errs = Vec::new();
-    for r in raws {
-        match parse_disable_target(r) {
-            Ok(t) => out.push(t),
-            Err(e) => errs.push(format!("  - {e}")),
+    for raw in raws {
+        match parse_disable_target(raw) {
+            Ok(target) => out.push(target),
+            Err(err) => errs.push(format!("  - {err}")),
         }
     }
     if !errs.is_empty() {
@@ -1484,17 +1539,81 @@ fn parse_disable_targets(raws: &[String]) -> Result<Vec<DisableTarget>> {
 
 /// True when at least one target matches the finding. File match is
 /// glob-based against `finding.file`; line match is an exact equal
-/// check against `finding.line` (only when the target specifies one).
+/// check against `finding.line` (only when the target specifies one);
+/// checksum match hashes `finding.matched`.
 fn finding_is_disabled(finding: &api::PokeFinding, targets: &[DisableTarget]) -> bool {
-    targets.iter().any(|t| {
-        if !t.matcher.is_match(&finding.file) {
+    targets.iter().any(|target| {
+        if !target.matcher.is_match(&finding.file) {
             return false;
         }
-        match t.line {
-            Some(n) => n == finding.line,
-            None => true,
+        match &target.scope {
+            DisableScope::Whole => true,
+            DisableScope::Line(n) => *n == finding.line,
+            DisableScope::Checksum(chk) => &finding_checksum(&finding.matched) == chk,
         }
     })
+}
+
+/// Redact `+` lines from the patch whose content hashes to any
+/// `--disable <glob>:<8hex>` target — converts the `+` prefix to
+/// a context space so the server's catalog skips the line and the
+/// hunk header math stays correct (` ` and `+` lines both count
+/// toward the hunk's `+B,M` total).
+///
+/// Each file block is checked against every target's glob; matching
+/// targets contribute their checksum set for the redaction walk.
+/// `+++ b/path` header lines are never confused with `+content`.
+fn redact_patch_by_checksum(patch: &str, targets: &[DisableTarget]) -> String {
+    let checksum_targets: Vec<(&globset::GlobMatcher, &String)> = targets
+        .iter()
+        .filter_map(|target| match &target.scope {
+            DisableScope::Checksum(chk) => Some((&target.matcher, chk)),
+            _ => None,
+        })
+        .collect();
+    if checksum_targets.is_empty() {
+        return patch.to_string();
+    }
+    let mut out = String::with_capacity(patch.len());
+    let mut current_checksums: std::collections::HashSet<&str> =
+        std::collections::HashSet::new();
+
+    for line in patch.split_inclusive('\n') {
+        if let Some(rest) = line.strip_prefix("diff --git ") {
+            current_checksums.clear();
+            if let Some(b_path) = rest
+                .split_whitespace()
+                .nth(1)
+                .and_then(|s| s.strip_prefix("b/"))
+                .map(|s| s.trim_end())
+            {
+                for (matcher, chk) in &checksum_targets {
+                    if matcher.is_match(b_path) {
+                        current_checksums.insert(chk.as_str());
+                    }
+                }
+            }
+            out.push_str(line);
+        } else if !current_checksums.is_empty()
+            && line.starts_with('+')
+            && !line.starts_with("+++")
+        {
+            // Hash the line content WITHOUT the leading `+` or the
+            // trailing newline. Trailing newline is patch transport,
+            // not part of the matched line.
+            let content = line[1..].trim_end_matches('\n');
+            let chk = finding_checksum(content);
+            if current_checksums.contains(chk.as_str()) {
+                out.push(' ');
+                out.push_str(&line[1..]);
+            } else {
+                out.push_str(line);
+            }
+        } else {
+            out.push_str(line);
+        }
+    }
+    out
 }
 
 /// Rewrite every `HEAD~N` token in `selector` so N never exceeds the
@@ -2035,17 +2154,59 @@ mod tests {
 
     #[test]
     fn parse_disable_target_file_only() {
-        let t = parse_disable_target("src/lib.rs").unwrap();
-        assert_eq!(t.line, None);
-        assert!(t.matcher.is_match("src/lib.rs"));
-        assert!(!t.matcher.is_match("src/other.rs"));
+        let target = parse_disable_target("src/lib.rs").unwrap();
+        assert!(matches!(target.scope, DisableScope::Whole));
+        assert!(target.matcher.is_match("src/lib.rs"));
+        assert!(!target.matcher.is_match("src/other.rs"));
     }
 
     #[test]
     fn parse_disable_target_with_line() {
-        let t = parse_disable_target("src/lib.rs:42").unwrap();
-        assert_eq!(t.line, Some(42));
-        assert!(t.matcher.is_match("src/lib.rs"));
+        let target = parse_disable_target("src/lib.rs:42").unwrap();
+        assert!(matches!(target.scope, DisableScope::Line(42)));
+        assert!(target.matcher.is_match("src/lib.rs"));
+    }
+
+    #[test]
+    fn parse_disable_target_with_checksum() {
+        let target = parse_disable_target("src/lib.rs:a1b2c3d4").unwrap();
+        match target.scope {
+            DisableScope::Checksum(ref chk) => assert_eq!(chk, "a1b2c3d4"),
+            _ => panic!("expected Checksum scope, got {:?}", target.scope),
+        }
+        assert!(target.matcher.is_match("src/lib.rs"));
+    }
+
+    #[test]
+    fn parse_disable_target_rejects_uppercase_hex_as_typo() {
+        // ABCDEF1A reads exactly like a checksum but is uppercase —
+        // canonical verdict-print is lowercase, so this is a clear
+        // copy-paste typo. Error explicitly rather than silently
+        // falling back to glob (which would match nothing and
+        // confuse the operator).
+        let err = parse_disable_target("src/lib.rs:ABCDEF1A")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("lowercase hex"),
+            "err must explain the lowercase requirement; got: {err}"
+        );
+    }
+
+    #[test]
+    fn finding_checksum_is_stable_for_same_input() {
+        let a = finding_checksum("let x = unused_variable_name;");
+        let b = finding_checksum("let x = unused_variable_name;");
+        assert_eq!(a, b);
+        assert_eq!(a.len(), 8);
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn finding_checksum_differs_on_whitespace_change() {
+        let normal = finding_checksum("let x = 1;");
+        let extra_space = finding_checksum("let  x = 1;");
+        assert_ne!(normal, extra_space, "whitespace must affect checksum so a reformat re-prompts review");
     }
 
     #[test]
@@ -2096,6 +2257,95 @@ mod tests {
             &mk_finding("src/lib.rs", 43, "placeholder"),
             &targets
         ));
+    }
+
+    #[test]
+    fn redact_patch_converts_matching_plus_line_to_context() {
+        let secret = "let password = \"oops\";";
+        let checksum = finding_checksum(secret);
+        let patch = format!(
+            "\
+diff --git a/src/lib.rs b/src/lib.rs
+index aaa..bbb 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,3 +1,4 @@
+ fn foo() {{
+     bar();
++{secret}
+ }}
+"
+        );
+        let targets = parse_disable_targets(&[format!("src/lib.rs:{checksum}")]).unwrap();
+        let redacted = redact_patch_by_checksum(&patch, &targets);
+        // The `+secret` line became ` secret` (context). The hunk
+        // header is untouched, the `+++ b/` header line survives
+        // because the redactor explicitly skips `+++`.
+        assert!(redacted.contains("+++ b/src/lib.rs"));
+        assert!(!redacted.contains(&format!("+{secret}")));
+        assert!(redacted.contains(&format!(" {secret}")));
+    }
+
+    #[test]
+    fn redact_patch_leaves_other_files_alone_when_glob_does_not_match() {
+        let target_line = "let foo = bar();";
+        let checksum = finding_checksum(target_line);
+        let patch = format!(
+            "\
+diff --git a/src/elsewhere.rs b/src/elsewhere.rs
+index aaa..bbb 100644
+--- a/src/elsewhere.rs
++++ b/src/elsewhere.rs
+@@ -1 +1,2 @@
+ mod x;
++{target_line}
+"
+        );
+        let targets = parse_disable_targets(&[format!("src/lib.rs:{checksum}")]).unwrap();
+        let redacted = redact_patch_by_checksum(&patch, &targets);
+        assert!(redacted.contains(&format!("+{target_line}")));
+    }
+
+    #[test]
+    fn redact_patch_no_op_when_no_checksum_targets() {
+        let patch = "\
+diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1 +1,2 @@
+ mod x;
++let y = 2;
+";
+        // file-only target, no checksum among args
+        let targets = parse_disable_targets(&["src/other.rs".into()]).unwrap();
+        let redacted = redact_patch_by_checksum(patch, &targets);
+        assert_eq!(redacted, patch);
+    }
+
+    #[test]
+    fn redact_patch_glob_matches_across_files() {
+        let muted = "let secret = \"x\";";
+        let checksum = finding_checksum(muted);
+        let patch = format!(
+            "\
+diff --git a/src/sdk-alpha/a.ts b/src/sdk-alpha/a.ts
+--- a/src/sdk-alpha/a.ts
++++ b/src/sdk-alpha/a.ts
+@@ -1 +1,2 @@
+ export const x = 1;
++{muted}
+diff --git a/src/sdk-alpha/b.ts b/src/sdk-alpha/b.ts
+--- a/src/sdk-alpha/b.ts
++++ b/src/sdk-alpha/b.ts
+@@ -1 +1,2 @@
+ export const y = 2;
++{muted}
+"
+        );
+        let targets = parse_disable_targets(&[format!("src/sdk-alpha/**:{checksum}")]).unwrap();
+        let redacted = redact_patch_by_checksum(&patch, &targets);
+        assert_eq!(redacted.matches(&format!("+{muted}")).count(), 0);
+        assert_eq!(redacted.matches(&format!(" {muted}")).count(), 2);
     }
 
     #[test]
