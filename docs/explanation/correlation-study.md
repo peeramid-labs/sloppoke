@@ -1,7 +1,7 @@
 # Correlation study — slop density vs OSS production failures
 
-> **Status:** Phase 1, anecdotal alignment, **not statistical
-> proof**. n = 5 hand-labelled cases. Confidence interval undefined.
+> **Status:** anecdotal alignment at n = 5 hand-labelled cases.
+> **Not statistical proof.** Confidence interval undefined.
 > Methodology pre-registered; corpus open under `sloppoke-bench/`
 > so anyone can re-run.
 
@@ -10,16 +10,16 @@ known LLM-coding patterns in source and downstream production
 failures. This page is the public artefact backing the claim.
 
 The honest framing matters. This is **anecdotal alignment** until
-the corpus reaches n ≥ 100. We publish anyway because:
+the corpus reaches n ≥ 100. The page is public anyway because:
 
 1. The signal in the seed n = 5 cases is strong enough to be worth
    discussing without overselling.
 2. The methodology, the inclusion criteria, and the named
    confounders are pre-registered. Operators can audit the work
    before the larger corpus closes.
-3. Phase 2 — statistical correlation at n ≥ 100 with confidence
-   intervals — supersedes this page when it lands. The Phase 1
-   plots remain underneath as case-study walkthroughs.
+3. The statistical correlation at n ≥ 100 with confidence
+   intervals supersedes this page when it lands; the case-study
+   walkthroughs underneath remain.
 
 ## What the bench measures
 
@@ -56,8 +56,8 @@ the main corpus. `1`–`2` candidates wait in `corpus/candidates.yml`.
 ## Confounders, named up front
 
 - **Velocity bias.** High-velocity repos correlate with both AI use
-  and incidents. Controlled in Phase 2 via commit-rate
-  normalisation.
+  and incidents. The statistical analysis controls for it via
+  commit-rate normalisation.
 - **Survivor bias.** Public AI-failure write-ups exist only for
   loud breakage. The silent-slop floor is unknown.
 - **Attribution drift.** Trailers fade out as AI use becomes the
@@ -79,19 +79,17 @@ the main corpus. `1`–`2` candidates wait in `corpus/candidates.yml`.
 Each case in `sloppoke-bench/corpus/<id>.yml` carries the full
 evidence chain.
 
-## Phase 1 plots
+## What the case plots show
 
-Once `scripts/scan-corpus.sh` runs against the corpus, per-case
-SVGs render to `sloppoke-bench/plot/output/<case_id>.svg` and the
-aggregate severity × peak-density scatter renders to
-`aggregate.svg`. The docs build embeds them inline:
+`scripts/scan-corpus.sh` renders per-case SVGs to
+`sloppoke-bench/plot/output/<case_id>.svg` and the aggregate
+severity × peak-density scatter to `aggregate.svg`. The docs build
+embeds them inline once the scan results JSON lands under
+`sloppoke-bench/results/`:
 
 ```html
 <img src="/assets/correlation-study/litellm.svg" alt="LiteLLM 1.86.2 timeline">
 ```
-
-(Embedding is wired up in the next sub-PR once the scan results
-JSON is committed under `sloppoke-bench/results/`.)
 
 The expected shape per case:
 
@@ -110,7 +108,7 @@ When the spike + marker line up, the per-case caption surfaces
 the failure". When they don't, we say so — negative results are
 not suppressed.
 
-## Phase 0 — corpus crawl
+## How the corpus is built
 
 The corpus is the gate. n = 5 is anecdote; n ≥ 100 is statistics;
 n ≥ 1000 is publishable.
@@ -138,13 +136,13 @@ Crawl channels (see `sloppoke-bench/crawler/`):
      subset.
 
 After production-impact filtering (the inclusion criteria above)
-the realistic Phase 2 n is **500–1500 confirmed cases**, not the
-100–200 the trailer + press channels alone reach. The crawlers
-run **only outside CI** against operator-owned PATs. Tests
-exercise the parsing layer with canned fixtures under
+the realistic statistical-corpus size is **500–1500 confirmed
+cases**, not the 100–200 the trailer + press channels alone reach.
+The crawlers run **only outside CI** against operator-owned PATs.
+Tests exercise the parsing layer with canned fixtures under
 `crawler/fixtures/`.
 
-## Phase 2 — statistical correlation (next)
+## Statistical correlation (when n ≥ 100)
 
 Pre-registered metrics:
 
