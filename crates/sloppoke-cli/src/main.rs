@@ -183,14 +183,6 @@ struct PokeArgs {
     /// Print the request JSON and exit without contacting the server.
     #[arg(long)]
     dry_run: bool,
-    /// Emit the verdict + findings as one JSON object on stdout
-    /// instead of the human-readable two-channel layout (stderr
-    /// summary + stdout colored patch). Designed for agentic
-    /// callers (Claude Code, CI bots) that need to bucket findings
-    /// without parsing the prose verdict line. Suppresses the
-    /// patch on stdout — pipe through `jq -r '.patch'` to apply.
-    #[arg(long)]
-    json: bool,
     /// One-shot per-scan mute. Each target is a patch-notation
     /// address — `path/glob` (file-level mute) or `path/glob:LINE`
     /// (line-level mute) — that filters matching findings out of
@@ -1015,30 +1007,6 @@ fn run_poke(args: PokeArgs) -> Result<()> {
         resp.patch.clone()
     };
 
-    if args.json {
-        // Single JSON object on stdout — designed for Claude Code /
-        // CI bots that want to bucket findings without parsing
-        // prose. Suppresses the human-readable summary + colored
-        // patch path entirely; pipe through `jq -r '.patch' |
-        // git apply --unidiff-zero` to apply.
-        let out = serde_json::json!({
-            "verdict": resp.verdict,
-            "poke_id": resp.poke_id,
-            "elapsed_ms": resp.elapsed_ms,
-            "usage": {
-                "poke_calls": resp.usage.poke_calls,
-                "cap": resp.cap,
-            },
-            "findings_count": kept_findings.len(),
-            "muted_count": muted.len(),
-            "findings": kept_findings,
-            "patch": patch_out,
-            "patch_present": !patch_out.trim().is_empty(),
-        });
-        println!("{}", serde_json::to_string(&out)?);
-        return Ok(());
-    }
-
     // Verdict + quota line lives on stderr so it's visible to
     // interactive users (self-teaching, quota awareness) without
     // polluting `> foo.patch` redirections or `| git apply` pipes.
@@ -1832,7 +1800,6 @@ mod tests {
             repo: repo.map(str::to_string),
             gh: gh.map(str::to_string),
             dry_run: false,
-            json: false,
             disable: Vec::new(),
         }
     }
@@ -1852,7 +1819,6 @@ mod tests {
             repo: None,
             gh: None,
             dry_run: false,
-            json: false,
             disable: Vec::new(),
         }
     }
@@ -1867,7 +1833,6 @@ mod tests {
             repo: None,
             gh: None,
             dry_run: false,
-            json: false,
             disable: Vec::new(),
         }
     }
