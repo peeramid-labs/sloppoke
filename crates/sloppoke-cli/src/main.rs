@@ -1341,13 +1341,6 @@ fn load_slopignore_builder() -> Result<globset::GlobSetBuilder> {
     Ok(builder)
 }
 
-/// Convenience wrapper that builds the `.slopignore` set without
-/// any `--disable` additions. Kept so tests and callers that just
-/// want the on-disk view can avoid threading an empty slice.
-fn load_slopignore() -> Result<globset::GlobSet> {
-    Ok(load_slopignore_builder()?.build()?)
-}
-
 /// Merge `.slopignore` patterns with the file-level `--disable`
 /// targets so the resulting globset can pre-filter file blocks out
 /// of the patch BEFORE sending. Line-level targets (`path:LINE`)

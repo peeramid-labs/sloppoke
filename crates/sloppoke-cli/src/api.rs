@@ -151,9 +151,13 @@ pub fn poke(cfg: &SavedConfig, project: Option<&str>, patch: &str) -> Result<Pok
 /// inline pricing (so the CLI can render a confidence-building
 /// onboarding screen without a round-trip), and the usage row that
 /// triggered the lockout.
+/// 402 response body the server returns when the caller's quota is
+/// exhausted. Carries the checkout URL the CLI opens for self-serve
+/// upgrade plus the optional `reason` / `slop_org` fields the
+/// dashboard renders. The CLI never inspects `reason` / `slop_org`
+/// today; they ride along for forward compatibility.
 #[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)] // reason / slop_org are accepted on the wire for
-                    // future use; allow until we surface them.
+#[allow(dead_code)]
 pub struct PaymentRequired {
     pub error: String,
     #[serde(default)]

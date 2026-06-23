@@ -38,10 +38,13 @@ const POLL_MAX_TICKS: u32 = 100; // ~5 minutes
 /// caller should re-run the original `poke` request, `Ok(false)`
 /// when the flow ended cleanly (user quit), or `Err` when something
 /// genuinely failed.
-pub fn handle_payment_required(cfg: &SavedConfig, pr: &PaymentRequired) -> Result<bool> {
-    print_pricing_block(pr);
+pub fn handle_payment_required(
+    saved_config: &SavedConfig,
+    payment_response: &PaymentRequired,
+) -> Result<bool> {
+    print_pricing_block(payment_response);
 
-    let Some(url) = pr.checkout_url.as_deref() else {
+    let Some(url) = payment_response.checkout_url.as_deref() else {
         bail!(
             "server reported quota exhausted but did not return a checkout URL — \
              contact engineering@peeramid.xyz with this fingerprint"
@@ -76,7 +79,7 @@ pub fn handle_payment_required(cfg: &SavedConfig, pr: &PaymentRequired) -> Resul
     }
 
     eprintln!("\nslop: waiting for subscription to land…");
-    let landed = poll_until_subscribed(cfg)?;
+    let landed = poll_until_subscribed(saved_config)?;
     if landed {
         eprintln!("slop: subscribed ✓ — re-running poke");
         return Ok(true);
@@ -88,17 +91,17 @@ pub fn handle_payment_required(cfg: &SavedConfig, pr: &PaymentRequired) -> Resul
     Ok(false)
 }
 
-fn print_pricing_block(pr: &PaymentRequired) {
+fn print_pricing_block(payment_response: &PaymentRequired) {
     eprintln!("\n──── PAYMENT REQUIRED ────");
-    if let Some(usage) = &pr.usage {
+    if let Some(usage) = &payment_response.usage {
         eprintln!(
             "Quota: {}/{} pokes used this cycle ({}).",
             usage.calls, usage.cap, usage.period,
         );
     } else {
-        eprintln!("{}", pr.error);
+        eprintln!("{}", payment_response.error);
     }
-    if let Some(p) = &pr.pricing {
+    if let Some(p) = &payment_response.pricing {
         let PaymentPricing {
             tier,
             currency,
@@ -183,13 +186,13 @@ fn open_url(url: &str) -> Result<()> {
 /// above the free baseline OR we time out. Free tier has zero pokes
 /// (FREE_POKE_CALLS=0), so any nonzero cap means a subscription
 /// landed.
-fn poll_until_subscribed(cfg: &SavedConfig) -> Result<bool> {
+fn poll_until_subscribed(saved_config: &SavedConfig) -> Result<bool> {
     use std::io::Write as _;
     let stderr = io::stderr();
     let mut handle = stderr.lock();
     for tick in 0..POLL_MAX_TICKS {
         thread::sleep(POLL_INTERVAL);
-        match api::billing_tier(cfg) {
+        match api::billing_tier(saved_config) {
             Ok(t) => {
                 if t.entitlements.poke_calls_cap > 0 {
                     return Ok(true);
@@ -207,4 +210,43 @@ fn poll_until_subscribed(cfg: &SavedConfig) -> Result<bool> {
     }
     let _ = writeln!(handle);
     Ok(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::PaymentUsage;
+
+    fn mk_payment(usage: Option<PaymentUsage>, pricing: Option<PaymentPricing>) -> PaymentRequired {
+        PaymentRequired {
+            error: "Payment required".into(),
+            reason: None,
+            checkout_url: Some("https://checkout.example.test/test-session".into()),
+            usage,
+            pricing,
+        }
+    }
+
+    #[test]
+    fn is_interactive_respects_slop_no_payment_autoopen() {
+        std::env::set_var("SLOP_NO_PAYMENT_AUTOOPEN", "1");
+        assert!(!is_interactive(), "env knob must force headless");
+        std::env::remove_var("SLOP_NO_PAYMENT_AUTOOPEN");
+    }
+
+    #[test]
+    fn is_interactive_respects_ci_env() {
+        std::env::set_var("CI", "true");
+        assert!(!is_interactive(), "CI=true must force headless");
+        std::env::remove_var("CI");
+    }
+
+    #[test]
+    fn print_pricing_block_handles_payment_with_no_usage_or_pricing() {
+        // Coverage smoke test: the formatting branches do not panic
+        // on minimal input (no usage, no pricing). Real wire format
+        // is covered by integration tests against the live server.
+        let payment_response = mk_payment(None, None);
+        print_pricing_block(&payment_response);
+    }
 }
