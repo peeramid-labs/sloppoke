@@ -1322,11 +1322,11 @@ fn resolve_patch(args: &PokeArgs) -> Result<(String, String)> {
 /// `.env.example` placeholder credentials, generated SDK shims at
 /// `*/sdk-alpha/**`) can list the paths once and stop sending those
 /// hunks to the scorer every commit.
-fn load_slopignore() -> Result<globset::GlobSet> {
+fn load_slopignore_builder() -> Result<globset::GlobSetBuilder> {
     let mut builder = globset::GlobSetBuilder::new();
     let path = PathBuf::from(".slopignore");
     if !path.exists() {
-        return Ok(builder.build()?);
+        return Ok(builder);
     }
     let raw = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
     for (n, line) in raw.lines().enumerate() {
@@ -1338,7 +1338,14 @@ fn load_slopignore() -> Result<globset::GlobSet> {
             .with_context(|| format!(".slopignore line {}: bad glob {:?}", n + 1, trimmed))?;
         builder.add(glob);
     }
-    Ok(builder.build()?)
+    Ok(builder)
+}
+
+/// Convenience wrapper that builds the `.slopignore` set without
+/// any `--disable` additions. Kept so tests and callers that just
+/// want the on-disk view can avoid threading an empty slice.
+fn load_slopignore() -> Result<globset::GlobSet> {
+    Ok(load_slopignore_builder()?.build()?)
 }
 
 /// Merge `.slopignore` patterns with the file-level `--disable`
@@ -1347,54 +1354,29 @@ fn load_slopignore() -> Result<globset::GlobSet> {
 /// are skipped here — those address single lines, not whole files,
 /// so they ride along until the response-side filter.
 ///
-/// Returns an empty globset (not an error) when `.slopignore` is
-/// absent and no `--disable` targets are passed; a malformed
-/// `.slopignore` file logs a warn and returns the `--disable`-only
-/// half so a typo'd repo config never blocks an explicit one-shot
-/// mute.
+/// A malformed `.slopignore` file logs a warn and returns the
+/// `--disable`-only half so a typo'd repo config never blocks an
+/// explicit one-shot mute.
 fn build_pre_send_globset(disable_raws: &[String]) -> Result<globset::GlobSet> {
-    let mut builder = match load_slopignore() {
-        Ok(set) if set.is_empty() => globset::GlobSetBuilder::new(),
-        Ok(_) => {
-            let mut b = globset::GlobSetBuilder::new();
-            let path = PathBuf::from(".slopignore");
-            if path.exists() {
-                let raw = fs::read_to_string(&path)
-                    .with_context(|| format!("read {}", path.display()))?;
-                for line in raw.lines() {
-                    let trimmed = line.trim();
-                    if trimmed.is_empty() || trimmed.starts_with('#') {
-                        continue;
-                    }
-                    if let Ok(g) = globset::Glob::new(trimmed) {
-                        b.add(g);
-                    }
-                }
-            }
-            b
-        }
-        Err(e) => {
-            eprintln!("slop: ignoring malformed .slopignore — {e}");
-            globset::GlobSetBuilder::new()
-        }
-    };
+    let mut builder = load_slopignore_builder().unwrap_or_else(|e| {
+        eprintln!("slop: ignoring malformed .slopignore — {e}");
+        globset::GlobSetBuilder::new()
+    });
     for raw in disable_raws {
-        // Skip line-level targets — `path:LINE` doesn't pre-filter
-        // a whole file block, only a single line inside it.
         let glob_str = match raw.rsplit_once(':') {
-            Some((prefix, tail)) if tail.parse::<usize>().is_ok() => {
-                let _ = prefix;
-                continue;
-            }
+            // Line-level target — pre-send filter only operates at
+            // file granularity, so let the line target ride along
+            // for response-side handling.
+            Some((_, tail)) if tail.parse::<usize>().is_ok() => continue,
             _ => raw.as_str(),
         };
         let trimmed = glob_str.trim();
         if trimmed.is_empty() {
             continue;
         }
-        let g = globset::Glob::new(trimmed)
+        let glob = globset::Glob::new(trimmed)
             .with_context(|| format!("--disable {trimmed:?}: bad glob"))?;
-        builder.add(g);
+        builder.add(glob);
     }
     Ok(builder.build()?)
 }
@@ -1926,18 +1908,18 @@ mod tests {
 
     #[test]
     fn remote_repo_url_passes_repo_through_verbatim() {
-        let a = args_with(Some("https://gitlab.com/owner/proj.git"), None);
+        let cli_args = args_with(Some("https://gitlab.com/owner/proj.git"), None);
         assert_eq!(
-            remote_repo_url(&a).as_deref(),
+            remote_repo_url(&cli_args).as_deref(),
             Some("https://gitlab.com/owner/proj.git")
         );
     }
 
     #[test]
     fn remote_repo_url_expands_gh_slug_to_github_https() {
-        let a = args_with(None, Some("openclaw/openclaw"));
+        let cli_args = args_with(None, Some("openclaw/openclaw"));
         assert_eq!(
-            remote_repo_url(&a).as_deref(),
+            remote_repo_url(&cli_args).as_deref(),
             Some("https://github.com/openclaw/openclaw.git")
         );
     }
@@ -1947,14 +1929,14 @@ mod tests {
         // Defensive: if the user fat-fingers a full URL into --gh
         // instead of the org/repo slug, pass it through rather than
         // rewriting it into `https://github.com/https://…`.
-        let a = args_with(None, Some("git@github.com:foo/bar.git"));
+        let cli_args = args_with(None, Some("git@github.com:foo/bar.git"));
         assert_eq!(
-            remote_repo_url(&a).as_deref(),
+            remote_repo_url(&cli_args).as_deref(),
             Some("git@github.com:foo/bar.git")
         );
-        let a = args_with(None, Some("https://example.test/foo.git"));
+        let cli_args = args_with(None, Some("https://example.test/foo.git"));
         assert_eq!(
-            remote_repo_url(&a).as_deref(),
+            remote_repo_url(&cli_args).as_deref(),
             Some("https://example.test/foo.git")
         );
     }
@@ -1964,12 +1946,12 @@ mod tests {
         // clap should reject this combination at parse time
         // (conflicts_with), but the function should still pick
         // deterministically if invoked programmatically.
-        let a = args_with(
+        let cli_args = args_with(
             Some("https://repo.test/x.git"),
             Some("ignored/forsclap-violators"),
         );
         assert_eq!(
-            remote_repo_url(&a).as_deref(),
+            remote_repo_url(&cli_args).as_deref(),
             Some("https://repo.test/x.git")
         );
     }
@@ -2090,10 +2072,10 @@ mod tests {
     #[test]
     fn finding_disabled_by_file_glob() {
         let targets = parse_disable_targets(&["src/sdk-alpha/**".into()]).unwrap();
-        let f = mk_finding("src/sdk-alpha/types.ts", 200, "any_cast");
-        assert!(finding_is_disabled(&f, &targets));
-        let g = mk_finding("src/db/q.ts", 99, "what_filler");
-        assert!(!finding_is_disabled(&g, &targets));
+        let inside_alpha = mk_finding("src/sdk-alpha/types.ts", 200, "any_cast");
+        assert!(finding_is_disabled(&inside_alpha, &targets));
+        let outside_alpha = mk_finding("src/db/q.ts", 99, "what_filler");
+        assert!(!finding_is_disabled(&outside_alpha, &targets));
     }
 
     #[test]
@@ -2110,25 +2092,26 @@ mod tests {
         let targets =
             parse_disable_targets(&["src/lib.rs:42".into(), "src/sdk-alpha/**".into()]).unwrap();
         assert!(finding_is_disabled(
-            &mk_finding("src/lib.rs", 42, "x"),
+            &mk_finding("src/lib.rs", 42, "placeholder"),
             &targets
         ));
         assert!(finding_is_disabled(
-            &mk_finding("src/sdk-alpha/y.ts", 1, "x"),
+            &mk_finding("src/sdk-alpha/y.ts", 1, "any_cast"),
             &targets
         ));
         assert!(!finding_is_disabled(
-            &mk_finding("src/lib.rs", 43, "x"),
+            &mk_finding("src/lib.rs", 43, "placeholder"),
             &targets
         ));
     }
 
     #[test]
     fn parse_disable_targets_aggregates_errors() {
-        let err = parse_disable_targets(&["src/ok.rs".into(), "".into(), "src/also-ok.rs:9".into()])
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("empty target"), "err was: {err}");
+        let parse_err =
+            parse_disable_targets(&["src/ok.rs".into(), "".into(), "src/also-ok.rs:9".into()])
+                .unwrap_err()
+                .to_string();
+        assert!(parse_err.contains("empty target"), "err was: {parse_err}");
     }
 
     #[test]
@@ -2149,19 +2132,19 @@ index ccc..ddd 100644
 -OLD=1
 +NEW=1
 ";
-        let mut b = globset::GlobSetBuilder::new();
-        b.add(globset::Glob::new(".env.example").unwrap());
-        let g = b.build().unwrap();
-        let out = filter_patch_by_slopignore(patch, &g);
-        assert!(out.contains("src/lib.rs"));
-        assert!(!out.contains(".env.example"));
+        let mut ignore_builder = globset::GlobSetBuilder::new();
+        ignore_builder.add(globset::Glob::new(".env.example").unwrap());
+        let ignore_set = ignore_builder.build().unwrap();
+        let filtered = filter_patch_by_slopignore(patch, &ignore_set);
+        assert!(filtered.contains("src/lib.rs"));
+        assert!(!filtered.contains(".env.example"));
     }
 
     #[test]
     fn filter_patch_by_slopignore_empty_globset_is_passthrough() {
         let patch = "diff --git a/foo b/foo\n+content\n";
-        let g = globset::GlobSet::empty();
-        assert_eq!(filter_patch_by_slopignore(patch, &g), patch);
+        let empty_set = globset::GlobSet::empty();
+        assert_eq!(filter_patch_by_slopignore(patch, &empty_set), patch);
     }
 
     #[test]
@@ -2173,8 +2156,8 @@ Subject: stuff
 diff --git a/keep.rs b/keep.rs
 +content
 ";
-        let g = globset::GlobSet::empty();
-        assert!(filter_patch_by_slopignore(patch, &g).starts_with("From abc"));
+        let empty_set = globset::GlobSet::empty();
+        assert!(filter_patch_by_slopignore(patch, &empty_set).starts_with("From abc"));
     }
 
     /// Regression: `cap_diff` historically used `diff[..max]` which
@@ -2213,11 +2196,10 @@ diff --git a/keep.rs b/keep.rs
         let global_dir = tmp.path().join("global-config");
         std::env::set_var("SLOP_CONFIG_DIR", &global_dir);
 
-        // 1. global_last_poke_path honours SLOP_CONFIG_DIR.
-        let p = global_last_poke_path().expect("path resolves");
-        assert_eq!(p, global_dir.join("last-poke.json"));
+        let resolved_global_path = global_last_poke_path().expect("path resolves");
+        assert_eq!(resolved_global_path, global_dir.join("last-poke.json"));
 
-        // 2. load_plan falls back to global when no cwd-local plan.
+        // load_plan falls back to global when no cwd-local plan exists.
         std::fs::create_dir_all(&global_dir).unwrap();
         let global_plan = CachedPlan {
             poke_id: "fallback-id".into(),
@@ -2235,7 +2217,7 @@ diff --git a/keep.rs b/keep.rs
         assert_eq!(loaded.poke_id, "fallback-id");
         assert_eq!(loaded.input_diff, "input body");
 
-        // 3. cwd-local plan beats global.
+        // cwd-local plan beats global.
         std::fs::create_dir_all(".slop").unwrap();
         let local_plan = CachedPlan {
             poke_id: "local-id".into(),
@@ -2248,9 +2230,9 @@ diff --git a/keep.rs b/keep.rs
         let loaded = load_plan().expect("local plan loads");
         assert_eq!(loaded.poke_id, "local-id");
 
-        // 4. attached_context_from_cached_plan splices BOTH the
-        //    input diff and the proposed patch under their labelled
-        //    fences so the operator gets the full before/after pair.
+        // attached_context_from_cached_plan splices BOTH the input
+        // diff and the proposed patch under their labelled fences
+        // so the operator gets the full before/after pair.
         let ctx_plan = CachedPlan {
             poke_id: "ctx-id".into(),
             verdict: "SLOP".into(),

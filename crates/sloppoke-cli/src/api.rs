@@ -207,9 +207,10 @@ struct LearnBody<'a> {
     context: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     project: Option<&'a str>,
-    /// Self-reported CLI version + build commit. Lets the offline RL
-    /// loop tell rows from old clients (missing auto-attach, etc.)
-    /// from rows from current clients. Server stores verbatim.
+    /// Joined against learn-row replay so the offline RL loop can
+    /// drop rows produced by an older CLI surface (e.g. before
+    /// `--disable` shipped, before context auto-attach landed)
+    /// without re-judging them against the current catalog.
     cli_version: &'a str,
 }
 
