@@ -2124,6 +2124,7 @@ diff --git a/keep.rs b/keep.rs
     fn cap_diff_does_not_panic_on_multibyte_boundary() {
 // TODO(slop): placeholder identifier — pick a name that says what this is
 // TODO(slop): placeholder identifier — pick a name that says what this is
+// TODO(slop): placeholder identifier — pick a name that says what this is
         let prefix = "+ ascii padding line\n".repeat(100);
         let payload = "+ comment — with em dash and more text following\n".repeat(200);
         let input = format!("{prefix}{payload}");
