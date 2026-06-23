@@ -85,21 +85,6 @@ enum Mode {
     /// Not for end-user release — gated behind an operator token
     /// on the orchestrator side and only built locally.
     Review(ReviewArgs),
-    /// Drop a single-use bypass token at `.slop/bypass-token` with the
-    /// caller's reason. The pre-commit hook consumes (deletes) the
-    /// token on its next run and skips the SLOP gate exactly once.
-    /// Reason is appended to `.slop/bypass-log.jsonl` for audit so
-    /// every bypass leaves a trail. Designed for the Claude Code
-    /// plugin path where SLOP_SKIP_HOOK=1 can't reach the hook
-    /// because the env is set in a subshell after the PreToolUse
-    /// hook fires.
-    Bypass(BypassArgs),
-}
-
-#[derive(Parser, Debug, Clone)]
-struct BypassArgs {
-    /// Free-text reason for the bypass. Goes into the audit log.
-    reason: String,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -206,6 +191,21 @@ struct PokeArgs {
     /// patch on stdout — pipe through `jq -r '.patch'` to apply.
     #[arg(long)]
     json: bool,
+    /// One-shot per-scan mute. Each target is a patch-notation
+    /// address — `path/glob` (file-level mute) or `path/glob:LINE`
+    /// (line-level mute) — that filters matching findings out of
+    /// THIS scan's response before any verdict is rendered. No
+    /// state is persisted: the next `slop poke` invocation has to
+    /// re-pass the target, or `slop learn --disable <target>
+    /// "<reason>"` upstream so the server stops flagging the
+    /// pattern for this org. Repeatable; comma-separated also OK.
+    ///
+    /// Example:
+    ///
+    ///   slop poke --disable 'src/sdk-alpha/**'
+    ///   slop poke --disable src/db/query.ts:99,src/lib.rs:42
+    #[arg(long, value_delimiter = ',')]
+    disable: Vec<String>,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -240,6 +240,19 @@ struct LearnArgs {
     /// reference a specific scan.
     #[arg(long)]
     no_attach: bool,
+    /// Patch-notation targets to escalate to the server's per-org
+    /// learn loop alongside the feedback prose. Same grammar as
+    /// `slop poke --disable`: `path/glob` for whole-file mute,
+    /// `path/glob:LINE` for line-level. Targets ride along inside
+    /// the feedback context block so the server's offline RL loop
+    /// can join "operator at <fingerprint> says <reason> applies
+    /// to <target>" against the original poke row.
+    ///
+    /// Nothing is written to disk — the mute is a server-side
+    /// catalog adjustment, not a local file. Future poke runs from
+    /// the same org get the lower FP rate automatically.
+    #[arg(long, value_delimiter = ',')]
+    disable: Vec<String>,
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -308,16 +321,17 @@ fn run(cli: Cli) -> Result<()> {
         Mode::News(a) => news::run(&news_server_url(), a.all, a.ack),
         Mode::Status => run_status(),
         Mode::Review(a) => run_review(a),
-        Mode::Bypass(a) => run_bypass(a),
     }
 }
 
 const HOOK_SCRIPT: &str = r##"#!/usr/bin/env sh
 # Installed by `slop install-hook`. Blocks `git commit` when sloppoke
-# flags slop in the staged diff. Bypass once with `git commit --no-verify`,
-# or `slop bypass "<reason>"` to drop a single-use token the hook
-# consumes on its next run (useful from agents that can't set
-# environment variables before `git commit` fires).
+# flags slop in the staged diff. Bypass once with
+# `git commit --no-verify`. To mute one specific finding without
+# a blanket bypass, re-stage with `slop poke --disable <path[:line]>`
+# included on a wrapper script, or send `slop learn --disable
+# <path[:line]> "<reason>"` upstream so the server stops flagging
+# the pattern for this org.
 set -e
 
 if ! command -v slop >/dev/null 2>&1; then
@@ -327,17 +341,6 @@ fi
 
 # Nothing staged → nothing to scan.
 if git diff --cached --quiet; then
-  exit 0
-fi
-
-# Single-use bypass token. Operator (or an agent acting on their
-# behalf) drops it via `slop bypass "<reason>"`; the hook consumes
-# the file and skips the scan exactly once. Mirrors the trust model
-# of `--no-verify` but leaves an audit trail.
-if [ -f .slop/bypass-token ]; then
-  reason=$(cat .slop/bypass-token 2>/dev/null | head -1)
-  rm -f .slop/bypass-token
-  echo "slop: bypass token consumed (reason: ${reason:-unspecified}). SLOP gate skipped this commit." >&2
   exit 0
 fi
 
@@ -556,44 +559,6 @@ fn run_status() -> Result<()> {
     Ok(())
 }
 
-// ── bypass ───────────────────────────────────────────────────────
-//
-// Drops `.slop/bypass-token` with the caller's reason. The
-// pre-commit hook (see `HOOK_SCRIPT`) reads the file, deletes it,
-// and skips the SLOP gate exactly once. Reason is also appended to
-// `.slop/bypass-log.jsonl` so the operator can audit who bypassed
-// what without grepping shell history.
-
-fn run_bypass(args: BypassArgs) -> Result<()> {
-    let dir = PathBuf::from(".slop");
-    fs::create_dir_all(&dir).context("create .slop directory")?;
-    let token_path = dir.join("bypass-token");
-    fs::write(&token_path, format!("{}\n", args.reason.trim()))
-        .with_context(|| format!("write {}", token_path.display()))?;
-    let log_path = dir.join("bypass-log.jsonl");
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let user = std::env::var("USER").unwrap_or_else(|_| "unknown".to_string());
-    let entry = serde_json::json!({
-        "ts": now,
-        "reason": args.reason,
-        "user": user,
-    });
-    let mut log = fs::OpenOptions::new()
-        .append(true)
-        .create(true)
-        .open(&log_path)
-        .with_context(|| format!("open {}", log_path.display()))?;
-    use std::io::Write;
-    writeln!(log, "{entry}").context("append bypass-log.jsonl")?;
-    eprintln!(
-        "slop: bypass token armed at {}. Next `git commit` skips the SLOP gate; the hook deletes the token after it consumes it.",
-        token_path.display()
-    );
-    Ok(())
-}
 
 // ── review (LOCAL ONLY) ──────────────────────────────────────────
 //
@@ -1030,6 +995,26 @@ fn run_poke(args: PokeArgs) -> Result<()> {
     };
     save_plan(&resp, &patch)?;
 
+    // Per-scan mute. Operator passes
+    //   slop poke --disable 'src/sdk-alpha/**' --disable src/lib.rs:42
+    // → matching findings get filtered out of the response BEFORE
+    // the verdict is rendered. Stateless: no file is written; the
+    // next scan has to re-pass the targets, or
+    // `slop learn --disable <target> "<reason>"` upstream so the
+    // server stops flagging the pattern for this org.
+    let disable_targets = parse_disable_targets(&args.disable)?;
+    let (kept_findings, muted): (Vec<_>, Vec<_>) = resp
+        .findings
+        .into_iter()
+        .partition(|f| !finding_is_disabled(f, &disable_targets));
+    let patch_out = if kept_findings.is_empty() && !muted.is_empty() {
+        // Every finding the server returned is muted → drop the
+        // patch entirely. Hook sees empty stdout → LGTM path.
+        String::new()
+    } else {
+        resp.patch.clone()
+    };
+
     if args.json {
         // Single JSON object on stdout — designed for Claude Code /
         // CI bots that want to bucket findings without parsing
@@ -1044,10 +1029,11 @@ fn run_poke(args: PokeArgs) -> Result<()> {
                 "poke_calls": resp.usage.poke_calls,
                 "cap": resp.cap,
             },
-            "findings_count": resp.findings.len(),
-            "findings": resp.findings,
-            "patch": resp.patch,
-            "patch_present": !resp.patch.trim().is_empty(),
+            "findings_count": kept_findings.len(),
+            "muted_count": muted.len(),
+            "findings": kept_findings,
+            "patch": patch_out,
+            "patch_present": !patch_out.trim().is_empty(),
         });
         println!("{}", serde_json::to_string(&out)?);
         return Ok(());
@@ -1060,16 +1046,27 @@ fn run_poke(args: PokeArgs) -> Result<()> {
         "slop poke: {} ({} ms, {}/{} this cycle)",
         resp.verdict, resp.elapsed_ms, resp.usage.poke_calls, resp.cap
     );
+    if !muted.is_empty() {
+        eprintln!("slop poke: muted {} finding(s) via --disable", muted.len());
+    }
+    // Per-finding patch-notation line on stderr so the operator can
+    // copy-paste straight into `--disable` or `slop learn --disable`
+    // without scanning the colored patch for path:line pairs.
+    for f in &kept_findings {
+        eprintln!("  {}:{}  {}", f.file, f.line, f.category);
+    }
     // The unified-diff patch on stdout. Color-aware for TTYs, ANSI
     // stripped for pipes / redirections so `git apply --unidiff-zero`
     // still works as a one-liner.
-    if !resp.patch.trim().is_empty() {
-        emit_patch_maybe_colored(&resp.patch);
+    if !patch_out.trim().is_empty() {
+        emit_patch_maybe_colored(&patch_out);
         // Apply hint on stderr — first-time users get the obvious
         // next step without having to read --help.
         eprintln!(
             "\nRun `slop apply` to apply, `slop apply --discard` to drop, \
-             or `git apply --unidiff-zero` if applying manually."
+             or `git apply --unidiff-zero` if applying manually. \
+             To mute a specific finding inline use `--disable <path[:line]>`; \
+             to train the server use `slop learn --disable <path[:line]> \"<reason>\"`."
         );
     }
     Ok(())
@@ -1425,6 +1422,75 @@ fn filter_patch_by_slopignore(patch: &str, ignore: &globset::GlobSet) -> String 
     out
 }
 
+/// One parsed `--disable` target. Mirrors patch-notation: a path
+/// glob, optionally narrowed to a single line. Compiled to a
+/// globset matcher at parse time so per-finding checks are O(1).
+#[derive(Debug)]
+struct DisableTarget {
+    matcher: globset::GlobMatcher,
+    line: Option<usize>,
+}
+
+/// Parse one CLI `--disable` argument. Grammar:
+///   <glob>            → file-level mute
+///   <glob>:<line>     → line-level mute
+/// The line suffix is everything after the LAST `:` so paths
+/// containing `:` (e.g. Windows drive letters in CI scenarios) only
+/// confuse the parser when the user actually means to address a
+/// numeric line — at which point we'd reject any non-numeric tail
+/// rather than misparse.
+fn parse_disable_target(raw: &str) -> Result<DisableTarget> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        anyhow::bail!("--disable: empty target");
+    }
+    let (glob_str, line) = match raw.rsplit_once(':') {
+        Some((prefix, tail)) => match tail.parse::<usize>() {
+            Ok(n) => (prefix, Some(n)),
+            Err(_) => (raw, None),
+        },
+        None => (raw, None),
+    };
+    let glob = globset::Glob::new(glob_str)
+        .with_context(|| format!("--disable {raw:?}: bad glob"))?;
+    Ok(DisableTarget {
+        matcher: glob.compile_matcher(),
+        line,
+    })
+}
+
+/// Parse a list of `--disable` args, collecting all errors into one
+/// message so the operator sees every bad target on the first try.
+fn parse_disable_targets(raws: &[String]) -> Result<Vec<DisableTarget>> {
+    let mut out = Vec::with_capacity(raws.len());
+    let mut errs = Vec::new();
+    for r in raws {
+        match parse_disable_target(r) {
+            Ok(t) => out.push(t),
+            Err(e) => errs.push(format!("  - {e}")),
+        }
+    }
+    if !errs.is_empty() {
+        anyhow::bail!("invalid --disable target(s):\n{}", errs.join("\n"));
+    }
+    Ok(out)
+}
+
+/// True when at least one target matches the finding. File match is
+/// glob-based against `finding.file`; line match is an exact equal
+/// check against `finding.line` (only when the target specifies one).
+fn finding_is_disabled(finding: &api::PokeFinding, targets: &[DisableTarget]) -> bool {
+    targets.iter().any(|t| {
+        if !t.matcher.is_match(&finding.file) {
+            return false;
+        }
+        match t.line {
+            Some(n) => n == finding.line,
+            None => true,
+        }
+    })
+}
+
 /// Rewrite every `HEAD~N` token in `selector` so N never exceeds the
 /// repo's actual history depth. Public repos often have only a handful
 /// of commits — without this, `slop poke --range HEAD~10..HEAD` on a
@@ -1592,6 +1658,12 @@ fn apply_via_git(plan: &CachedPlan, args: ApplyArgs) -> Result<()> {
 fn run_learn(args: LearnArgs) -> Result<()> {
     let cfg = api::load_config()
         .context("`slop learn` needs a server config. Run `slop login` first.")?;
+    // Validate `--disable` targets eagerly so a typo bails BEFORE
+    // the upstream POST burns quota and confuses the operator with
+    // a "queued" reply that didn't actually pin the bad target.
+    if !args.disable.is_empty() {
+        parse_disable_targets(&args.disable)?;
+    }
     // Auto-attach the cached poke plan when the caller didn't pass
     // their own --context. Saves a copy-paste step and gives the RL
     // loop a concrete (poke_id, patch) pair to join the feedback
@@ -1601,19 +1673,47 @@ fn run_learn(args: LearnArgs) -> Result<()> {
     } else {
         None
     };
-    let context = args.context.as_deref().or(auto_context.as_deref());
-    let resp = api::learn(&cfg, &args.feedback, context, args.project.as_deref())?;
-    eprintln!(
-        "slop learn: queued {} ({}/{}) — {} bytes{}",
-        resp.entry_id,
-        resp.queued,
-        resp.monthly_cap,
-        resp.bytes,
-        if auto_context.is_some() {
-            " (attached last poke)"
-        } else {
-            ""
+    // Splice the `--disable` targets into the context so the server-
+    // side learn loop links the feedback row to the exact patch
+    // addresses the operator wants muted. Format: one target per
+    // line under a clear marker so the offline RL parser can pick
+    // them out without a schema change.
+    let target_block = if args.disable.is_empty() {
+        String::new()
+    } else {
+        let mut s = String::from("--- disable_targets ---\n");
+        for t in &args.disable {
+            s.push_str(t);
+            s.push('\n');
         }
+        s
+    };
+    let merged_context = match (auto_context.as_deref(), args.context.as_deref()) {
+        (Some(a), Some(b)) => Some(format!("{a}\n{b}\n{target_block}")),
+        (Some(a), None) => Some(format!("{a}\n{target_block}")),
+        (None, Some(b)) => Some(format!("{b}\n{target_block}")),
+        (None, None) if !target_block.is_empty() => Some(target_block.clone()),
+        (None, None) => None,
+    };
+    let resp = api::learn(
+        &cfg,
+        &args.feedback,
+        merged_context.as_deref(),
+        args.project.as_deref(),
+    )?;
+    let attach_note = if auto_context.is_some() {
+        " (attached last poke)"
+    } else {
+        ""
+    };
+    let target_note = if args.disable.is_empty() {
+        String::new()
+    } else {
+        format!(" + {} disable target(s)", args.disable.len())
+    };
+    eprintln!(
+        "slop learn: queued {} ({}/{}) — {} bytes{attach_note}{target_note}",
+        resp.entry_id, resp.queued, resp.monthly_cap, resp.bytes,
     );
     Ok(())
 }
@@ -1733,6 +1833,7 @@ mod tests {
             gh: gh.map(str::to_string),
             dry_run: false,
             json: false,
+            disable: Vec::new(),
         }
     }
 
@@ -1752,6 +1853,7 @@ mod tests {
             gh: None,
             dry_run: false,
             json: false,
+            disable: Vec::new(),
         }
     }
 
@@ -1766,6 +1868,7 @@ mod tests {
             gh: None,
             dry_run: false,
             json: false,
+            disable: Vec::new(),
         }
     }
 
@@ -1915,6 +2018,89 @@ mod tests {
             "body should land on a line boundary: tail={:?}",
             &body[body.len().saturating_sub(40)..]
         );
+    }
+
+    fn mk_finding(file: &str, line: usize, category: &str) -> api::PokeFinding {
+        api::PokeFinding {
+            file: file.into(),
+            line,
+            category: category.into(),
+            matched: "x".into(),
+            content: String::new(),
+        }
+    }
+
+    #[test]
+    fn parse_disable_target_file_only() {
+        let t = parse_disable_target("src/lib.rs").unwrap();
+        assert_eq!(t.line, None);
+        assert!(t.matcher.is_match("src/lib.rs"));
+        assert!(!t.matcher.is_match("src/other.rs"));
+    }
+
+    #[test]
+    fn parse_disable_target_with_line() {
+        let t = parse_disable_target("src/lib.rs:42").unwrap();
+        assert_eq!(t.line, Some(42));
+        assert!(t.matcher.is_match("src/lib.rs"));
+    }
+
+    #[test]
+    fn parse_disable_target_glob() {
+        let t = parse_disable_target("src/sdk-alpha/**").unwrap();
+        assert!(t.matcher.is_match("src/sdk-alpha/foo.ts"));
+        assert!(t.matcher.is_match("src/sdk-alpha/nested/bar.ts"));
+        assert!(!t.matcher.is_match("src/elsewhere/baz.ts"));
+    }
+
+    #[test]
+    fn parse_disable_target_rejects_empty() {
+        assert!(parse_disable_target("").is_err());
+        assert!(parse_disable_target("   ").is_err());
+    }
+
+    #[test]
+    fn finding_disabled_by_file_glob() {
+        let targets = parse_disable_targets(&["src/sdk-alpha/**".into()]).unwrap();
+        let f = mk_finding("src/sdk-alpha/types.ts", 200, "any_cast");
+        assert!(finding_is_disabled(&f, &targets));
+        let g = mk_finding("src/db/q.ts", 99, "what_filler");
+        assert!(!finding_is_disabled(&g, &targets));
+    }
+
+    #[test]
+    fn finding_disabled_by_path_and_line() {
+        let targets = parse_disable_targets(&["src/lib.rs:42".into()]).unwrap();
+        let exact = mk_finding("src/lib.rs", 42, "placeholder");
+        let same_file_diff_line = mk_finding("src/lib.rs", 43, "placeholder");
+        assert!(finding_is_disabled(&exact, &targets));
+        assert!(!finding_is_disabled(&same_file_diff_line, &targets));
+    }
+
+    #[test]
+    fn finding_disabled_collects_multiple_targets() {
+        let targets =
+            parse_disable_targets(&["src/lib.rs:42".into(), "src/sdk-alpha/**".into()]).unwrap();
+        assert!(finding_is_disabled(
+            &mk_finding("src/lib.rs", 42, "x"),
+            &targets
+        ));
+        assert!(finding_is_disabled(
+            &mk_finding("src/sdk-alpha/y.ts", 1, "x"),
+            &targets
+        ));
+        assert!(!finding_is_disabled(
+            &mk_finding("src/lib.rs", 43, "x"),
+            &targets
+        ));
+    }
+
+    #[test]
+    fn parse_disable_targets_aggregates_errors() {
+        let err = parse_disable_targets(&["src/ok.rs".into(), "".into(), "src/also-ok.rs:9".into()])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("empty target"), "err was: {err}");
     }
 
     #[test]
