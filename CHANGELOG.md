@@ -4,6 +4,25 @@
 
 
 
+
+## [0.9.0] - 2026-06-23
+
+### 🚀 Features
+
+- *(plugin)* Migrate plugin source to peeramid-labs/plugin-marketplace
+- *(cli)* UX fixes — learn panic, --json, slop bypass, .slopignore
+
+### 🚜 Refactor
+
+- *(cli)* Replace finding-id mute with patch-notation --disable
+- *(cli)* Drop slop poke --json — file:line stderr already structured
+
+### 📚 Documentation
+
+- *(explanation)* Add how-sloppoke-compares + index entry
+- *(readme)* List correlation-study explanation page
+- *(explanation)* Mirror correlation-study with academic dataset channel
+
 ## [0.8.3] - 2026-06-13
 
 ### 🐛 Bug Fixes
