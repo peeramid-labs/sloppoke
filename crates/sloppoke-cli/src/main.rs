@@ -950,13 +950,18 @@ fn run_poke(args: PokeArgs) -> Result<()> {
     // `.slopignore` skips per-file blocks before they reach the
     // server. Cuts both bill (smaller payload) AND noise (server
     // never matches FP patterns the operator has already triaged).
-    let ignore = load_slopignore().unwrap_or_else(|e| {
-        eprintln!("slop: ignoring malformed .slopignore — {e}");
-        globset::GlobSet::empty()
-    });
+    // `--disable <glob>` (file-only, no `:LINE` suffix) folds into
+    // the same globset so a one-shot mute also strips its file
+    // block pre-send. Line-level `--disable <glob>:LINE` targets
+    // ride along and apply post-receive against finding records
+    // (and against future hunk-level patch filtering — TODO).
+    // Validate --disable shape now so a malformed target bails
+    // BEFORE the patch hits the wire (and burns quota).
+    let _ = parse_disable_targets(&args.disable)?;
+    let ignore = build_pre_send_globset(&args.disable)?;
     let patch = filter_patch_by_slopignore(&patch, &ignore);
     if patch.trim().is_empty() {
-        bail!("nothing to scan ({source})");
+        bail!("nothing to scan ({source}) — every changed file is muted via .slopignore / --disable");
     }
     if args.dry_run {
         let preview = serde_json::json!({
@@ -1332,6 +1337,64 @@ fn load_slopignore() -> Result<globset::GlobSet> {
         let glob = globset::Glob::new(trimmed)
             .with_context(|| format!(".slopignore line {}: bad glob {:?}", n + 1, trimmed))?;
         builder.add(glob);
+    }
+    Ok(builder.build()?)
+}
+
+/// Merge `.slopignore` patterns with the file-level `--disable`
+/// targets so the resulting globset can pre-filter file blocks out
+/// of the patch BEFORE sending. Line-level targets (`path:LINE`)
+/// are skipped here — those address single lines, not whole files,
+/// so they ride along until the response-side filter.
+///
+/// Returns an empty globset (not an error) when `.slopignore` is
+/// absent and no `--disable` targets are passed; a malformed
+/// `.slopignore` file logs a warn and returns the `--disable`-only
+/// half so a typo'd repo config never blocks an explicit one-shot
+/// mute.
+fn build_pre_send_globset(disable_raws: &[String]) -> Result<globset::GlobSet> {
+    let mut builder = match load_slopignore() {
+        Ok(set) if set.is_empty() => globset::GlobSetBuilder::new(),
+        Ok(_) => {
+            let mut b = globset::GlobSetBuilder::new();
+            let path = PathBuf::from(".slopignore");
+            if path.exists() {
+                let raw = fs::read_to_string(&path)
+                    .with_context(|| format!("read {}", path.display()))?;
+                for line in raw.lines() {
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() || trimmed.starts_with('#') {
+                        continue;
+                    }
+                    if let Ok(g) = globset::Glob::new(trimmed) {
+                        b.add(g);
+                    }
+                }
+            }
+            b
+        }
+        Err(e) => {
+            eprintln!("slop: ignoring malformed .slopignore — {e}");
+            globset::GlobSetBuilder::new()
+        }
+    };
+    for raw in disable_raws {
+        // Skip line-level targets — `path:LINE` doesn't pre-filter
+        // a whole file block, only a single line inside it.
+        let glob_str = match raw.rsplit_once(':') {
+            Some((prefix, tail)) if tail.parse::<usize>().is_ok() => {
+                let _ = prefix;
+                continue;
+            }
+            _ => raw.as_str(),
+        };
+        let trimmed = glob_str.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let g = globset::Glob::new(trimmed)
+            .with_context(|| format!("--disable {trimmed:?}: bad glob"))?;
+        builder.add(g);
     }
     Ok(builder.build()?)
 }
