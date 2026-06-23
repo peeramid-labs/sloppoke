@@ -2168,16 +2168,14 @@ diff --git a/keep.rs b/keep.rs
     /// blows up here instead of in production.
     #[test]
     fn cap_diff_does_not_panic_on_multibyte_boundary() {
-// TODO(slop): placeholder identifier — pick a name that says what this is
-// TODO(slop): placeholder identifier — pick a name that says what this is
-// TODO(slop): placeholder identifier — pick a name that says what this is
-        let prefix = "+ ascii padding line\n".repeat(100);
-        let payload = "+ comment — with em dash and more text following\n".repeat(200);
-        let input = format!("{prefix}{payload}");
+        let ascii_prefix = "+ ascii padding line\n".repeat(100);
+        let multibyte_payload =
+            "+ comment — with em dash and more text following\n".repeat(200);
+        let combined_diff = format!("{ascii_prefix}{multibyte_payload}");
         for budget in [1024usize, 2048, 3000, 4097] {
-            let out = cap_diff(&input, budget, "test");
+            let truncated = cap_diff(&combined_diff, budget, "test");
             assert!(
-                out.contains("test truncated"),
+                truncated.contains("test truncated"),
                 "marker missing at budget {budget}"
             );
         }
