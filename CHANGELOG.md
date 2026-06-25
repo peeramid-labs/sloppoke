@@ -5,6 +5,30 @@
 
 
 
+
+## [0.10.0] - 2026-06-25
+
+### 🚀 Features
+
+- *(cli)* Content-checksum --disable targets + pre-send line redaction
+- *(cli)* Inline checksum on per-finding stderr summary
+- *(cli)* Slop apply --skip + auto-learn-on-skip + checksum stderr
+
+### 🐛 Bug Fixes
+
+- *(cli)* --disable now filters the submitted patch, not just findings
+
+### 📚 Documentation
+
+- *(explanation)* Drop dev-process framing from correlation-study
+
+### ⚙️ Miscellaneous Tasks
+
+- *(cli)* Splice slop marker on cap_diff test placeholder
+- *(cli)* Rename test placeholders + tighten api.rs cli_version doc
+- *(cli)* Rename cap_diff regression-test bindings + drop accreted slop markers
+- *(cli)* Rename payment.rs placeholders + docstring PaymentRequired + drop dead load_slopignore
+
 ## [0.9.0] - 2026-06-23
 
 ### 🚀 Features
