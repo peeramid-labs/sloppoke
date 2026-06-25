@@ -234,10 +234,13 @@ mod tests {
     use super::*;
 
     /// Single-test serialization: news tests mutate the process-global
-    /// `SLOP_CONFIG_DIR` env var, so they can't run in parallel.
-    /// Every assertion lives inside this one #[test] to dodge races.
+    /// `SLOP_CONFIG_DIR` env var, so they can't run in parallel —
+    /// and they share that env knob with
+    /// `main::tests::cached_plan_roundtrip_and_attach_context`, so
+    /// the lock has to live at crate root (test_globals).
     #[test]
     fn news_cache_and_seen_roundtrip() {
+        let _guard = crate::test_globals::lock_cwd();
         let tmp = tempfile::tempdir().unwrap();
         std::env::set_var("SLOP_CONFIG_DIR", tmp.path());
 

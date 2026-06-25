@@ -9,6 +9,21 @@
 mod api;
 mod news;
 mod payment;
+
+/// Process-wide locks for tests that mutate global state (cwd,
+/// SLOP_CONFIG_DIR). Lives at crate root so siblings (news::tests,
+/// main::tests) can serialise against the same Mutex instance —
+/// per-module OnceLocks would yield distinct Mutex<()> values and
+/// the race would survive. Compiled out of release builds.
+#[cfg(test)]
+pub(crate) mod test_globals {
+    pub(crate) fn lock_cwd() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
 mod ssh_resolve;
 mod version_check;
 
@@ -575,7 +590,6 @@ fn run_status() -> Result<()> {
     Ok(())
 }
 
-
 // ── review (LOCAL ONLY) ──────────────────────────────────────────
 //
 // Thin wrapper: shells out to `slop-review-local` which carries the
@@ -989,7 +1003,9 @@ fn run_poke(args: PokeArgs) -> Result<()> {
     let patch = filter_patch_by_slopignore(&patch, &ignore);
     let patch = redact_patch_by_checksum(&patch, &disable_targets);
     if patch.trim().is_empty() {
-        bail!("nothing to scan ({source}) — every changed file is muted via .slopignore / --disable");
+        bail!(
+            "nothing to scan ({source}) — every changed file is muted via .slopignore / --disable"
+        );
     }
     if args.dry_run {
         let preview = serde_json::json!({
@@ -1517,7 +1533,9 @@ pub fn finding_checksum(line: &str) -> String {
 }
 
 fn looks_like_checksum(s: &str) -> bool {
-    s.len() == 8 && s.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+    s.len() == 8
+        && s.chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
 }
 
 /// Parse one CLI `--disable` argument. Grammar:
@@ -1538,9 +1556,7 @@ fn parse_disable_target(raw: &str) -> Result<DisableTarget> {
         Some((prefix, tail)) if looks_like_checksum(tail) => {
             (prefix, DisableScope::Checksum(tail.to_string()))
         }
-        Some((_, tail))
-            if tail.len() == 8 && tail.chars().all(|c| c.is_ascii_hexdigit()) =>
-        {
+        Some((_, tail)) if tail.len() == 8 && tail.chars().all(|c| c.is_ascii_hexdigit()) => {
             anyhow::bail!(
                 "--disable {raw:?}: checksum suffix must be lowercase hex \
                  (got {tail:?}); the verdict output always prints lowercase, \
@@ -1553,8 +1569,8 @@ fn parse_disable_target(raw: &str) -> Result<DisableTarget> {
         },
         None => (raw, DisableScope::Whole),
     };
-    let glob = globset::Glob::new(glob_str)
-        .with_context(|| format!("--disable {raw:?}: bad glob"))?;
+    let glob =
+        globset::Glob::new(glob_str).with_context(|| format!("--disable {raw:?}: bad glob"))?;
     Ok(DisableTarget {
         matcher: glob.compile_matcher(),
         scope,
@@ -1616,8 +1632,7 @@ fn redact_patch_by_checksum(patch: &str, targets: &[DisableTarget]) -> String {
         return patch.to_string();
     }
     let mut out = String::with_capacity(patch.len());
-    let mut current_checksums: std::collections::HashSet<&str> =
-        std::collections::HashSet::new();
+    let mut current_checksums: std::collections::HashSet<&str> = std::collections::HashSet::new();
 
     for line in patch.split_inclusive('\n') {
         if let Some(rest) = line.strip_prefix("diff --git ") {
@@ -1635,9 +1650,7 @@ fn redact_patch_by_checksum(patch: &str, targets: &[DisableTarget]) -> String {
                 }
             }
             out.push_str(line);
-        } else if !current_checksums.is_empty()
-            && line.starts_with('+')
-            && !line.starts_with("+++")
+        } else if !current_checksums.is_empty() && line.starts_with('+') && !line.starts_with("+++")
         {
             // Hash the line content WITHOUT the leading `+` or the
             // trailing newline. Trailing newline is patch transport,
@@ -1751,7 +1764,10 @@ fn parse_slop_category(splice_body: &str) -> String {
 /// as "no checksum available".
 fn read_source_line(file: &str, n: usize) -> Option<String> {
     let content = fs::read_to_string(file).ok()?;
-    content.lines().nth(n.saturating_sub(1)).map(|s| s.to_string())
+    content
+        .lines()
+        .nth(n.saturating_sub(1))
+        .map(|s| s.to_string())
 }
 
 /// Drop hunks from a cached server-rendered patch whose flagged
@@ -1998,9 +2014,7 @@ fn apply_via_git(plan: &CachedPlan, args: ApplyArgs) -> Result<()> {
         .count()
         .saturating_sub(patch_to_apply.matches("@@ ").count());
     if dropped > 0 {
-        eprintln!(
-            "slop: --skip dropped {dropped} hunk(s) from the cached patch before git apply",
-        );
+        eprintln!("slop: --skip dropped {dropped} hunk(s) from the cached patch before git apply",);
     }
 
     // Dry-run preflight: --check exits non-zero if the diff would not
@@ -2259,6 +2273,7 @@ fn run_billing(cmd: BillingCmd) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_globals::lock_cwd;
 
     fn args_with(repo: Option<&str>, gh: Option<&str>) -> PokeArgs {
         PokeArgs {
@@ -2519,7 +2534,10 @@ mod tests {
     fn finding_checksum_differs_on_whitespace_change() {
         let normal = finding_checksum("let x = 1;");
         let extra_space = finding_checksum("let  x = 1;");
-        assert_ne!(normal, extra_space, "whitespace must affect checksum so a reformat re-prompts review");
+        assert_ne!(
+            normal, extra_space,
+            "whitespace must affect checksum so a reformat re-prompts review"
+        );
     }
 
     #[test]
@@ -2699,6 +2717,7 @@ diff --git a/src/lib.rs b/src/lib.rs
 
     #[test]
     fn extract_finding_summaries_reads_checksum_from_disk_when_present() {
+        let _guard = lock_cwd();
         let dir = tempfile::tempdir().unwrap();
         let prev = std::env::current_dir().unwrap();
         std::env::set_current_dir(dir.path()).unwrap();
@@ -2722,6 +2741,7 @@ diff --git a/src/lib.rs b/src/lib.rs
 
     #[test]
     fn filter_patch_by_skip_drops_only_matching_hunks() {
+        let _guard = lock_cwd();
         let dir = tempfile::tempdir().unwrap();
         let prev = std::env::current_dir().unwrap();
         std::env::set_current_dir(dir.path()).unwrap();
@@ -2742,7 +2762,10 @@ index aaa..bbb 100644
         let mut skip = std::collections::HashSet::new();
         skip.insert(drop_chk.clone());
         let filtered = filter_patch_by_skip_checksums(patch, &skip);
-        assert!(filtered.contains("keep_me"), "non-skipped hunk should remain");
+        assert!(
+            filtered.contains("keep_me"),
+            "non-skipped hunk should remain"
+        );
         assert!(
             !filtered.contains("placeholder identifier"),
             "skipped hunk should drop: filtered was:\n{filtered}"
@@ -2754,6 +2777,7 @@ index aaa..bbb 100644
 
     #[test]
     fn filter_patch_by_skip_drops_file_header_when_all_hunks_drop() {
+        let _guard = lock_cwd();
         let dir = tempfile::tempdir().unwrap();
         let prev = std::env::current_dir().unwrap();
         std::env::set_current_dir(dir.path()).unwrap();
@@ -2876,8 +2900,7 @@ diff --git a/keep.rs b/keep.rs
     #[test]
     fn cap_diff_does_not_panic_on_multibyte_boundary() {
         let ascii_prefix = "+ ascii padding line\n".repeat(100);
-        let multibyte_payload =
-            "+ comment — with em dash and more text following\n".repeat(200);
+        let multibyte_payload = "+ comment — with em dash and more text following\n".repeat(200);
         let combined_diff = format!("{ascii_prefix}{multibyte_payload}");
         for budget in [1024usize, 2048, 3000, 4097] {
             let truncated = cap_diff(&combined_diff, budget, "test");
@@ -2894,6 +2917,7 @@ diff --git a/keep.rs b/keep.rs
     /// process-global state. Same pattern news::tests uses.
     #[test]
     fn cached_plan_roundtrip_and_attach_context() {
+        let _guard = lock_cwd();
         let tmp = tempfile::tempdir().unwrap();
         let prev_dir = std::env::current_dir().unwrap();
         let prev_cfg = std::env::var("SLOP_CONFIG_DIR").ok();
