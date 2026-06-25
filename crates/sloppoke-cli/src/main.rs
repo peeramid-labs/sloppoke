@@ -211,6 +211,30 @@ struct ApplyArgs {
     /// Skip the `git commit --amend` step — leave changes staged.
     #[arg(long)]
     no_commit: bool,
+    /// Comma-separated list of 8-hex finding checksums to omit from
+    /// the cached patch before `git apply` runs. The matching TODO
+    /// splices (and the surrounding hunks) drop out so the patch
+    /// can land without the markers piling on findings the operator
+    /// has already triaged as false positives.
+    ///
+    /// Pull ids from the `[<8hex>]` column in the `slop poke`
+    /// verdict; the same checksums also work as `--disable` targets
+    /// on a future poke if you want to redact the line pre-send.
+    ///
+    /// Skipped findings are auto-shipped to the server's learn loop
+    /// in a single batched entry so tomorrow's catalog de-ranks the
+    /// pattern for your org — no separate `slop learn` call needed.
+    /// Pair with `--skip-reason` to attach explicit context.
+    #[arg(long, value_delimiter = ',')]
+    skip: Vec<String>,
+    /// Optional explicit reason attached to the auto-learn entry the
+    /// CLI ships when `--skip` consumes one or more hunks. Without
+    /// it, the server records a generic "operator used --skip at
+    /// apply time" feedback; with it, the catalog gets the WHY
+    /// alongside the checksum targets and the training signal is
+    /// sharper. Stays empty when `--skip` is empty.
+    #[arg(long)]
+    skip_reason: Option<String>,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -1730,6 +1754,122 @@ fn read_source_line(file: &str, n: usize) -> Option<String> {
     content.lines().nth(n.saturating_sub(1)).map(|s| s.to_string())
 }
 
+/// Drop hunks from a cached server-rendered patch whose flagged
+/// source line hashes to one of the supplied `skip_ids`. Used by
+/// `slop apply --skip <ids>` so the operator can land the patch
+/// without the TODO markers piling on findings they've already
+/// triaged as false positives.
+///
+/// Stays surgical at the hunk level — same hunk-shape contract as
+/// the server's emitted patch (`@@ -A,0 +B,N @@` + a TODO splice).
+/// If every hunk in a file block drops, the file block drops too;
+/// the cleaned patch is still a valid input for `git apply`.
+fn filter_patch_by_skip_checksums(
+    patch: &str,
+    skip_ids: &std::collections::HashSet<String>,
+) -> String {
+    if skip_ids.is_empty() {
+        return patch.to_string();
+    }
+    let drop_keys: std::collections::HashSet<(String, usize)> = extract_finding_summaries(patch)
+        .into_iter()
+        .filter(|summary| {
+            summary
+                .checksum
+                .as_ref()
+                .is_some_and(|chk| skip_ids.contains(chk))
+        })
+        .map(|summary| (summary.file, summary.line))
+        .collect();
+    if drop_keys.is_empty() {
+        return patch.to_string();
+    }
+
+    // Two-buffer walk: emit the file-block header (diff/index/---/+++)
+    // lazily so a file whose every hunk drops also drops its header
+    // — leaves a clean patch instead of orphan file headers.
+    let mut out = String::with_capacity(patch.len());
+    let mut current_path: Option<String> = None;
+    let mut header_buf = String::new();
+    let mut header_emitted = false;
+    let mut in_dropped_hunk = false;
+
+    for line in patch.split_inclusive('\n') {
+        if let Some(rest) = line.strip_prefix("diff --git ") {
+            header_buf.clear();
+            header_emitted = false;
+            in_dropped_hunk = false;
+            current_path = rest
+                .split_whitespace()
+                .nth(1)
+                .and_then(|s| s.strip_prefix("b/"))
+                .map(|s| s.trim_end().to_string());
+            header_buf.push_str(line);
+        } else if line.starts_with("--- ") || line.starts_with("+++ ") || line.starts_with("index ")
+        {
+            if header_emitted {
+                out.push_str(line);
+            } else {
+                header_buf.push_str(line);
+            }
+        } else if line.starts_with("@@ ") {
+            let b_start = line
+                .split_whitespace()
+                .find_map(|tok| tok.strip_prefix('+'))
+                .and_then(|s| s.split(',').next())
+                .and_then(|n| n.parse::<usize>().ok())
+                .unwrap_or(0);
+            let key = (current_path.clone().unwrap_or_default(), b_start);
+            if drop_keys.contains(&key) {
+                in_dropped_hunk = true;
+            } else {
+                in_dropped_hunk = false;
+                if !header_emitted {
+                    out.push_str(&header_buf);
+                    header_emitted = true;
+                }
+                out.push_str(line);
+            }
+        } else if !in_dropped_hunk {
+            if !header_emitted {
+                header_buf.push_str(line);
+            } else {
+                out.push_str(line);
+            }
+        }
+    }
+    out
+}
+
+/// Build the `(feedback, context)` pair the auto-learn POST carries
+/// after a successful `slop apply --skip`. Factored out so the
+/// payload shape can be unit-tested without a live server hit.
+///
+/// The path glob is intentionally `**` per target so the catalog
+/// learns the FP applies anywhere the pattern shows up, not just on
+/// the path this particular apply landed on. Keeps the training
+/// signal repo-agnostic.
+fn build_skip_learn_payload(
+    skip_ids: &[String],
+    skip_reason: Option<&str>,
+    dropped_hunks: usize,
+) -> (String, String) {
+    let feedback = match skip_reason {
+        Some(reason) if !reason.trim().is_empty() => reason.trim().to_string(),
+        _ => format!(
+            "Operator used `slop apply --skip` to drop {dropped_hunks} TODO splice(s) — \
+             implicit FP signal, no explicit reason provided"
+        ),
+    };
+    let mut context = String::from("--- disable_targets ---\n");
+    for chk in skip_ids {
+        context.push_str("**:");
+        context.push_str(chk);
+        context.push('\n');
+    }
+    (feedback, context)
+}
+
 /// Rewrite every `HEAD~N` token in `selector` so N never exceeds the
 /// repo's actual history depth. Public repos often have only a handful
 /// of commits — without this, `slop poke --range HEAD~10..HEAD` on a
@@ -1840,6 +1980,29 @@ fn git_run(args: &[&str]) -> Result<()> {
 /// ships as a separate commit.
 fn apply_via_git(plan: &CachedPlan, args: ApplyArgs) -> Result<()> {
     use std::io::Write;
+    // `--skip <ids>` strips the matching hunks from the cached patch
+    // before git sees it, so the operator can land the patch without
+    // markers piling on findings they've already triaged as FPs.
+    let skip_ids: std::collections::HashSet<String> = args.skip.iter().cloned().collect();
+    let patch_to_apply = filter_patch_by_skip_checksums(&plan.patch, &skip_ids);
+    if patch_to_apply.trim().is_empty() {
+        eprintln!(
+            "slop: nothing to apply after --skip filter ({} skip id(s) consumed every hunk)",
+            args.skip.len()
+        );
+        return Ok(());
+    }
+    let dropped = plan
+        .patch
+        .matches("@@ ")
+        .count()
+        .saturating_sub(patch_to_apply.matches("@@ ").count());
+    if dropped > 0 {
+        eprintln!(
+            "slop: --skip dropped {dropped} hunk(s) from the cached patch before git apply",
+        );
+    }
+
     // Dry-run preflight: --check exits non-zero if the diff would not
     // apply cleanly. Surface the actual git stderr so the user knows
     // why before we mutate anything.
@@ -1853,7 +2016,7 @@ fn apply_via_git(plan: &CachedPlan, args: ApplyArgs) -> Result<()> {
         .stdin
         .as_mut()
         .expect("stdin piped")
-        .write_all(plan.patch.as_bytes())
+        .write_all(patch_to_apply.as_bytes())
         .context("write patch to git apply --check")?;
     let preflight = check.wait_with_output().context("wait git apply --check")?;
     if !preflight.status.success() {
@@ -1872,7 +2035,7 @@ fn apply_via_git(plan: &CachedPlan, args: ApplyArgs) -> Result<()> {
         .stdin
         .as_mut()
         .expect("stdin piped")
-        .write_all(plan.patch.as_bytes())
+        .write_all(patch_to_apply.as_bytes())
         .context("write patch to git apply")?;
     let status = apply.wait().context("wait git apply")?;
     if !status.success() {
@@ -1883,6 +2046,42 @@ fn apply_via_git(plan: &CachedPlan, args: ApplyArgs) -> Result<()> {
     }
 
     eprintln!("slop: applied server patch (verdict: {})", plan.verdict);
+
+    // Auto-learn: every `--skip` that actually dropped at least one
+    // hunk ships a single batched learn entry so tomorrow's catalog
+    // de-ranks the pattern for this org. The operator does NOT have
+    // to run a separate `slop learn` call — the apply itself is the
+    // training signal. Quota-friendly: one entry per invocation, not
+    // one per skipped checksum.
+    if dropped > 0 {
+        let (feedback, context_block) =
+            build_skip_learn_payload(&args.skip, args.skip_reason.as_deref(), dropped);
+        match api::load_config() {
+            Ok(cfg) => match api::learn(&cfg, &feedback, Some(&context_block), None) {
+                Ok(resp) => {
+                    eprintln!(
+                        "slop: shipped {} skip signal(s) to the learn loop ({}/{} this cycle, {} bytes) — \
+                         tomorrow's catalog will de-rank these patterns for your org",
+                        args.skip.len(),
+                        resp.queued,
+                        resp.monthly_cap,
+                        resp.bytes,
+                    );
+                }
+                Err(err) => {
+                    eprintln!(
+                        "slop: apply succeeded; auto-learn submission failed ({err}) — \
+                         your changes are safe but the catalog did not record this skip"
+                    );
+                }
+            },
+            Err(_) => {
+                // No login → no learn signal. Operator already saw the
+                // patch land; nothing to disrupt.
+            }
+        }
+    }
+
     if args.no_commit {
         eprintln!("slop: staged. Commit when ready.");
         return Ok(());
@@ -2519,6 +2718,98 @@ diff --git a/src/lib.rs b/src/lib.rs
             Some(finding_checksum("let specific_marker_token = 42;").as_str())
         );
         std::env::set_current_dir(prev).unwrap();
+    }
+
+    #[test]
+    fn filter_patch_by_skip_drops_only_matching_hunks() {
+        let dir = tempfile::tempdir().unwrap();
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+        let src = "fn keep_me() {}\nlet placeholder_var = 1;\nfn also_keep() {}\n";
+        fs::create_dir_all("src").unwrap();
+        fs::write("src/lib.rs", src).unwrap();
+        let patch = "\
+diff --git a/src/lib.rs b/src/lib.rs
+index aaa..bbb 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,0 +1,1 @@
++// TODO(slop): keep_me — survives because this checksum is not in --skip
+@@ -2,0 +2,1 @@
++// TODO(slop): placeholder identifier — pick a name that says what this is
+";
+        let drop_chk = finding_checksum("let placeholder_var = 1;");
+        let mut skip = std::collections::HashSet::new();
+        skip.insert(drop_chk.clone());
+        let filtered = filter_patch_by_skip_checksums(patch, &skip);
+        assert!(filtered.contains("keep_me"), "non-skipped hunk should remain");
+        assert!(
+            !filtered.contains("placeholder identifier"),
+            "skipped hunk should drop: filtered was:\n{filtered}"
+        );
+        // File header survives because at least one hunk was kept.
+        assert!(filtered.contains("diff --git a/src/lib.rs"));
+        std::env::set_current_dir(prev).unwrap();
+    }
+
+    #[test]
+    fn filter_patch_by_skip_drops_file_header_when_all_hunks_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+        let src = "fn lonely_target() {}\n";
+        fs::create_dir_all("src").unwrap();
+        fs::write("src/lonely.rs", src).unwrap();
+        let patch = "\
+diff --git a/src/lonely.rs b/src/lonely.rs
+--- a/src/lonely.rs
++++ b/src/lonely.rs
+@@ -1,0 +1,1 @@
++// TODO(slop): placeholder identifier — pick a name that says what this is
+";
+        let drop_chk = finding_checksum("fn lonely_target() {}");
+        let mut skip = std::collections::HashSet::new();
+        skip.insert(drop_chk);
+        let filtered = filter_patch_by_skip_checksums(patch, &skip);
+        assert!(
+            !filtered.contains("diff --git"),
+            "file with every hunk skipped should drop entirely; got:\n{filtered}"
+        );
+        std::env::set_current_dir(prev).unwrap();
+    }
+
+    #[test]
+    fn build_skip_learn_payload_uses_explicit_reason_when_provided() {
+        let (feedback, context) = build_skip_learn_payload(
+            &["3e1cc88d".into(), "fc10f7dd".into()],
+            Some("Zama SDK alpha types churn"),
+            2,
+        );
+        assert_eq!(feedback, "Zama SDK alpha types churn");
+        assert!(context.starts_with("--- disable_targets ---\n"));
+        assert!(context.contains("**:3e1cc88d\n"));
+        assert!(context.contains("**:fc10f7dd\n"));
+    }
+
+    #[test]
+    fn build_skip_learn_payload_falls_back_to_generic_feedback() {
+        let (feedback, _) = build_skip_learn_payload(&["abc12345".into()], None, 1);
+        assert!(feedback.contains("slop apply --skip"));
+        assert!(feedback.contains("1 TODO splice"));
+    }
+
+    #[test]
+    fn build_skip_learn_payload_empty_reason_string_falls_back_too() {
+        let (feedback, _) = build_skip_learn_payload(&["abc12345".into()], Some("   "), 3);
+        assert!(feedback.contains("implicit FP signal"));
+        assert!(feedback.contains("3 TODO splice"));
+    }
+
+    #[test]
+    fn filter_patch_by_skip_no_op_with_empty_skip_set() {
+        let patch = "diff --git a/x.rs b/x.rs\n+content\n";
+        let skip = std::collections::HashSet::new();
+        assert_eq!(filter_patch_by_skip_checksums(patch, &skip), patch);
     }
 
     #[test]
