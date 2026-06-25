@@ -1025,12 +1025,29 @@ fn run_poke(args: PokeArgs) -> Result<()> {
     if !muted.is_empty() {
         eprintln!("slop poke: muted {} finding(s) via --disable", muted.len());
     }
-    // Per-finding patch-notation line on stderr so the operator can
-    // copy-paste straight into `--disable` or `slop learn --disable`
-    // without scanning the colored patch for path:line pairs.
-    for f in &kept_findings {
-        eprintln!("  {}:{}  {}", f.file, f.line, f.category);
+    // Per-finding patch-notation summary on stderr so the operator
+    // can copy a target straight into `--disable` or
+    // `slop learn --disable` without re-deriving anything.
+    //
+    // The server's `findings` vec ships empty in production (the
+    // catalog isn't exposed on the wire), so we walk the response
+    // patch ourselves: each `@@ -X,0 +B,N @@` followed by
+    // `+// TODO(slop): <category>: …` is a marker spliced ABOVE the
+    // flagged source line at b-side line `B`. Reading the working-
+    // tree file at line B gives us the actual flagged content,
+    // which we hash so the operator can use the stable checksum
+    // form (`<file>:<8hex>`) of the mute target.
+    for summary in extract_finding_summaries(&patch_out) {
+        let chksum_field = match summary.checksum {
+            Some(chk) => format!("  [{chk}]"),
+            None => String::new(),
+        };
+        eprintln!(
+            "  {}:{}{chksum_field}  {}",
+            summary.file, summary.line, summary.category
+        );
     }
+    let _ = &kept_findings;
     // The unified-diff patch on stdout. Color-aware for TTYs, ANSI
     // stripped for pipes / redirections so `git apply --unidiff-zero`
     // still works as a one-liner.
@@ -1614,6 +1631,103 @@ fn redact_patch_by_checksum(patch: &str, targets: &[DisableTarget]) -> String {
         }
     }
     out
+}
+
+/// One row in the per-finding stderr summary the operator scans to
+/// decide whether to mute a finding.
+#[derive(Debug, PartialEq, Eq)]
+struct FindingSummary {
+    file: String,
+    /// b-side line number where the TODO marker would land (and
+    /// equivalently the source-file line being annotated).
+    line: usize,
+    /// Catalog category as parsed from the splice text — e.g.
+    /// `placeholder identifier`, `what_filler_comment`.
+    category: String,
+    /// 8-hex content fingerprint of the source-file line at
+    /// `line`. `None` when the source line couldn't be read (file
+    /// missing, line out of range), in which case the operator
+    /// falls back to the line-number escape hatch.
+    checksum: Option<String>,
+}
+
+/// Walk a server-rendered patch and emit one row per `TODO(slop):`
+/// splice. The catalog category text is parsed out of the splice
+/// itself; the source-line content is read from the current working
+/// tree so the checksum survives whatever the operator does next
+/// (apply, discard, ignore).
+fn extract_finding_summaries(patch: &str) -> Vec<FindingSummary> {
+    let mut out = Vec::new();
+    let mut current_path: Option<String> = None;
+    let mut hunk_b_start: Option<usize> = None;
+
+    for line in patch.lines() {
+        if let Some(rest) = line.strip_prefix("diff --git ") {
+            current_path = rest
+                .split_whitespace()
+                .nth(1)
+                .and_then(|s| s.strip_prefix("b/"))
+                .map(|s| s.trim_end().to_string());
+            hunk_b_start = None;
+            continue;
+        }
+        if line.starts_with("@@ ") {
+            // Header shape: `@@ -A,B +C,D @@ optional`.
+            // Parse the `+C` part. The b-start is where the splice
+            // sits in the new file.
+            hunk_b_start = line
+                .split_whitespace()
+                .find_map(|tok| tok.strip_prefix('+'))
+                .and_then(|s| s.split(',').next())
+                .and_then(|n| n.parse::<usize>().ok());
+            continue;
+        }
+        // Marker shapes the server emits per filetype:
+        //   `+// TODO(slop): …`         Rust / TS / JS / C / Go
+        //   `+# TODO(slop): …`          Python / shell / YAML
+        //   `+<!-- TODO(slop): … -->`   Markdown / HTML
+        let splice_body = line
+            .strip_prefix("+// TODO(slop):")
+            .or_else(|| line.strip_prefix("+# TODO(slop):"))
+            .or_else(|| {
+                line.strip_prefix("+<!-- TODO(slop):")
+                    .and_then(|rest| rest.strip_suffix("-->"))
+            });
+        if let Some(splice) = splice_body {
+            let (file, line_num) = match (&current_path, hunk_b_start) {
+                (Some(p), Some(n)) => (p.clone(), n),
+                _ => continue,
+            };
+            let category = parse_slop_category(splice);
+            let checksum = read_source_line(&file, line_num).map(|s| finding_checksum(&s));
+            out.push(FindingSummary {
+                file,
+                line: line_num,
+                category,
+                checksum,
+            });
+        }
+    }
+    out
+}
+
+/// Parse `<category> — <prose>` out of the body of a TODO(slop)
+/// splice. Falls back to the raw splice text when no `—` is
+/// present so the operator still sees something useful.
+fn parse_slop_category(splice_body: &str) -> String {
+    let trimmed = splice_body.trim_start();
+    match trimmed.split_once('—') {
+        Some((category, _)) => category.trim().to_string(),
+        None => trimmed.to_string(),
+    }
+}
+
+/// Read line `n` (1-indexed) from `file` in the current working
+/// directory. Returns None on any failure — caller treats absent
+/// as "no checksum available".
+fn read_source_line(file: &str, n: usize) -> Option<String> {
+    let content = fs::read_to_string(file).ok()?;
+    content.lines().nth(n.saturating_sub(1)).map(|s| s.to_string())
 }
 
 /// Rewrite every `HEAD~N` token in `selector` so N never exceeds the
@@ -2346,6 +2460,65 @@ diff --git a/src/sdk-alpha/b.ts b/src/sdk-alpha/b.ts
         let redacted = redact_patch_by_checksum(&patch, &targets);
         assert_eq!(redacted.matches(&format!("+{muted}")).count(), 0);
         assert_eq!(redacted.matches(&format!(" {muted}")).count(), 2);
+    }
+
+    #[test]
+    fn extract_finding_summaries_walks_todo_splices_into_rows() {
+        let patch = "\
+diff --git a/src/lib.rs b/src/lib.rs
+index aaa..bbb 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -41,0 +41,1 @@
++// TODO(slop): placeholder identifier — pick a name that says what this is
+@@ -99,0 +99,1 @@
++// TODO(slop): what_filler_comment — restating the next line in prose
+";
+        let summaries = extract_finding_summaries(patch);
+        assert_eq!(summaries.len(), 2);
+        assert_eq!(summaries[0].file, "src/lib.rs");
+        assert_eq!(summaries[0].line, 41);
+        assert_eq!(summaries[0].category, "placeholder identifier");
+        assert_eq!(summaries[1].line, 99);
+        assert_eq!(summaries[1].category, "what_filler_comment");
+        // Source file doesn't exist in this test → checksum stays None.
+        assert!(summaries[0].checksum.is_none());
+    }
+
+    #[test]
+    fn extract_finding_summaries_falls_back_when_category_lacks_em_dash() {
+        let patch = "\
+diff --git a/src/lib.rs b/src/lib.rs
++++ b/src/lib.rs
+@@ -1,0 +1,1 @@
++// TODO(slop): some_other_category_without_dash
+";
+        let summaries = extract_finding_summaries(patch);
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].category, "some_other_category_without_dash");
+    }
+
+    #[test]
+    fn extract_finding_summaries_reads_checksum_from_disk_when_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+        let src = "fn foo() {\nlet specific_marker_token = 42;\nbar();\n}\n";
+        fs::create_dir_all("src").unwrap();
+        fs::write("src/lib.rs", src).unwrap();
+        let patch = "\
+diff --git a/src/lib.rs b/src/lib.rs
++++ b/src/lib.rs
+@@ -2,0 +2,1 @@
++// TODO(slop): placeholder identifier — pick a name that says what this is
+";
+        let summaries = extract_finding_summaries(patch);
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(
+            summaries[0].checksum.as_deref(),
+            Some(finding_checksum("let specific_marker_token = 42;").as_str())
+        );
+        std::env::set_current_dir(prev).unwrap();
     }
 
     #[test]
